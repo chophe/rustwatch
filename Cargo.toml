@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustwatch-core",
+    "crates/rustwatch-capture",
+    "crates/rustwatch-daemon",
+    "crates/rustwatch-cli",
+    "crates/rustwatch-analyze",
+    "crates/rustwatch-memory",
+    "crates/rustwatch-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Chophe"]
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+console = "0.15"
+crossterm = "0.28"
+directories = "5"
+indicatif = "0.17"
+owo-colors = "4"
+ratatui = "0.29"
+refinery = { version = "0.8", features = ["rusqlite"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-indicatif = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+rustwatch-analyze = { path = "crates/rustwatch-analyze" }
+rustwatch-capture = { path = "crates/rustwatch-capture" }
+rustwatch-core = { path = "crates/rustwatch-core" }
+rustwatch-daemon = { path = "crates/rustwatch-daemon" }
+rustwatch-memory = { path = "crates/rustwatch-memory" }
+
+[profile.release]
+lto = true
+codegen-units = 1
