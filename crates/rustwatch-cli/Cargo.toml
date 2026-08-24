@@ -1,0 +1,32 @@
+[package]
+name = "rustwatch-cli"
+description = "CLI for rustwatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustwatch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+comfy-table.workspace = true
+console.workspace = true
+crossterm.workspace = true
+indicatif.workspace = true
+owo-colors.workspace = true
+ratatui.workspace = true
+rustwatch-analyze.workspace = true
+rustwatch-capture.workspace = true
+rustwatch-core.workspace = true
+rustwatch-memory.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-indicatif.workspace = true
+tracing-subscriber.workspace = true
+libc = "0.2"
