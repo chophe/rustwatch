@@ -1,246 +1,324 @@
----
-last_mapped_commit: c8ba2a9e65b063c9dbc60fc393d554bb99e9ca7a
-last_mapped_at: 2026-10-02
----
 # Testing Patterns
 
 **Analysis Date:** 2026-10-02
 
-## Current State: There Is No Test Suite
+## Current State: There Are No Tests
 
-This codebase has **zero tests**. Nothing in this document is a pattern to copy — it is a record of what does not exist plus an inventory of what the code already exposes to make testing possible when it starts.
+This is the single most important fact in this document.
 
-**Verified absences (all checked against `crates/`, 2026-10-02):**
+| Check | Result |
+|---|---|
+| `#[cfg(test)]` modules in `crates/` | **0** across 30 `.rs` files (`rg -c "cfg\(test\)"` → 0 matches, 38 files searched) |
+| `#[test]` / `#[tokio::test]` attributes | **0** |
+| `tests/` directories in any crate | **0** |
+| `[dev-dependencies]` in any `Cargo.toml` | **0** across 8 manifests |
+| `.config/nextest.toml`, `.github/workflows/*.yml` | do not exist |
+| Coverage config (tarpaulin, llvm-cov, cargo-llvm-cov.toml) | does not exist |
 
-| Thing | Status | How verified |
-|---|---|---|
-| `#[cfg(test)]` modules | **0** | `rg 'cfg\(test\)' --type rust` → no matches |
-| `#[test]` / `#[tokio::test]` | **0** | `rg '#\[test\]\|#\[tokio::test\]' --type rust` → no matches |
-| `mod tests` | **0** | `rg 'mod tests' --type rust` → no matches |
-| `tests/`, `benches/`, `examples/` dirs | **0** | `fd -t d -g 'tests' -g 'benches' -g 'examples'` → none |
-| `[dev-dependencies]` sections | **0** | `rg 'dev-dependencies' -g '*.toml'` → no matches in any of the 8 manifests |
-| Test crates in `Cargo.lock` | **none** | 648 locked packages; `proptest`, `wiremock`, `assert_cmd`, `predicates`, `insta`, `rstest`, `mockall`, `criterion`, `quickcheck`, `serial_test` all absent. `tempfile` appears **only as a transitive dependency**, not as a dev-dep |
-| CI workflow / quality gate | **none** | No `.github/`, no `.config/nextest.toml`, no `deny.toml` |
+**`cargo test --workspace` exits 0** and prints ten times:
+```
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+The build reports success while asserting nothing. Any pipeline that treats a zero exit code as "tests pass" is green on an empty suite. Until at least one test exists, the only meaningful gate is `cargo clippy` (which does emit real warnings — see `CONVENTIONS.md`).
 
-`cargo test --workspace` today compiles the workspace and runs **0 tests**. `docs/TESTING_PLAN.md` is a written plan with **no code behind it** — treat it as intent, not as an existing convention. (See "Planned, Not Implemented" at the end.)
+`crates/rustwatch-memory-backends` has no tests either, and is additionally excluded from `--workspace`, so it is never compiled or tested by any command in `README.md`.
 
 ## Test Framework
 
 **Runner:**
-
-- **None installed.** The built-in `libtest` harness would work with zero setup (`cargo test` discovers `#[test]` fns), but no test target exists.
-- No `cargo-nextest` config. No `#[bench]` targets. No criterion setup.
+- Rust's built-in `libtest`, invoked only through `cargo test`. Not configured, not installed as a separate tool.
+- Nothing else is wired in.
 
 **Assertion Library:**
+- None. No `assert_cmd`, `predicates`, `insta`, `similar`, or hand-rolled helpers.
 
-- **None.** `assert!`, `assert_eq!`, and `pretty_assertions` are all absent from the tree. Stock `assert_eq!` is the zero-dependency default and matches the project's current "no dev-deps" posture.
-
-**Assertion style when tests are added:**
-Use stock `assert_eq!` / `assert!` from std. Introducing `pretty_assertions` would mean the first `[dev-dependencies]` block in the workspace.
-
-**Run Commands:**
-
+**Available run commands (all currently vacuous):**
 ```bash
-cargo test --workspace              # runs 0 tests today
+cargo test                          # run everything (0 tests)
+cargo test -p rustwatch-core        # per-crate; lib target only, no test target exists
 cargo test --workspace -- --nocapture
-cargo nextest run --workspace       # NOT installed; no .config/nextest.toml exists
+cargo nextest run --workspace       # NOT INSTALLED — required by docs/TESTING_PLAN.md:112
+cargo llvm-cov --workspace          # NOT INSTALLED — required by docs/TESTING_PLAN.md:115
 ```
+
+## The Test Plan That Already Exists
+
+`docs/TESTING_PLAN.md` (127 lines, last touched 2026-08-24) is a complete, unimplemented six-phase design. **Read it before writing tests — it names the target functions and the intended libraries precisely.** It has never been started: none of the dev-dependencies, `.config/nextest.toml`, `.github/workflows/test.yml`, or `tests/` files it specifies exist.
+
+**Strategy table (`docs/TESTING_PLAN.md:5-12`) — four layers:**
+
+| Layer | Scope | Tooling |
+|---|---|---|
+| Unit | Pure functions & types, one module at a time | `#[cfg(test)]`, `proptest` for edge cases |
+| Behavior | Given/When/Then across a component's public API | `#[cfg(test)]`, scenario-named tests |
+| Integration | Real SQLite / LanceDB / SurrealDB / Unix sockets / stdio JSON-RPC | `tests/` dirs + `tempfile` |
+| HTTP contract | OpenAI/Anthropic classifier request/response behavior | `wiremock` |
+
+**Planned dependency set (`docs/TESTING_PLAN.md:16-29`) — none of this is installed:**
+```toml
+# [workspace.dependencies]
+tempfile = "3"
+proptest = "1"
+```
+| Crate | Extra dev-dependencies |
+|---|---|
+| `rustwatch-analyze` | `wiremock = "0.6"`, `tokio-test` |
+| `rustwatch-mcp` | `assert_cmd = "2"`, `predicates = "3"` |
+| `rustwatch-cli` | `assert_cmd`, `predicates` |
+| `rustwatch-daemon` | none — requires a lib/bin split first (Phase 4) |
+| `rustwatch-memory-backends` | none — requires workspace membership first |
+
+**Planned CI gate (`docs/TESTING_PLAN.md:109-115`):**
+```bash
+cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace
+```
+Two jobs: macOS runner for real capture paths, Ubuntu runner to validate the stub-platform path. Coverage via llvm-cov with a **≥80% target on the core / analyze / memory libraries**. Both halves of that gate currently fail: `cargo fmt --check` reports 45 diff hunks (see `CONVENTIONS.md`), and `-D warnings` would fail on the 3 existing clippy warnings.
+
+## Testable Seams That Already Exist
+
+These are functions with no filesystem, network, or platform dependency. They are the natural first targets — `docs/TESTING_PLAN.md:31-66` enumerates nearly all of them.
+
+**Pure logic, reachable today from a `#[cfg(test)] mod tests` in the same file:**
+
+| Function | File:line | Notes |
+|---|---|---|
+| `SegmentGrouper::on_event` / `flush` | `crates/rustwatch-core/src/segment.rs:28,63` | Full state machine over `CaptureEvent`; no I/O. Plan covers focus open/close, append order, snapshot-replace, `MAX_BUFFER_CHARS` eviction |
+| `hash_embedding` | `crates/rustwatch-memory/src/embedder.rs:46` | Private; deterministic, 384-dim, L2-normalized. Plan wants determinism + normalization properties |
+| `GraphRag::merge` | `crates/rustwatch-memory/src/rag.rs:6` | `pub`, static method on a unit struct. Keyword boost `+0.2` at `:12`, max-score dedup by `chunk_id` at `:17`, desc sort at `:29` |
+| `Redactor::scrub` / `is_excluded_app` | `crates/rustwatch-analyze/src/redact.rs:25,36` | `pub`; pure once a `Redactor` exists. `Redactor::new` only compiles regexes |
+| `key_to_text`, `active_modifiers`, `scope_label`, `hash_content` | `crates/rustwatch-capture/src/platform/macos.rs:252,165,348,355` | Private, macOS-only module, no platform handles. `hash_content` is currently dead code |
+| `Cosine`, `bytes_to_f32` | `crates/rustwatch-memory/src/sqlite_store.rs:131,124` | Private; plan wants round-trip, known cosine values, zero-vector safety |
+| `slug` | `crates/rustwatch-memory/src/graph.rs:112` and `crates/rustwatch-memory-backends/src/surreal.rs:113` | **Duplicated verbatim across two crates.** Plan names the `graph.rs` copy |
+| `expand_tilde` | `crates/rustwatch-core/src/paths.rs:58` | Pure string logic over `HOME` |
+| `parse_ts` | `crates/rustwatch-core/src/db.rs:252` | Private; plan wants the bad-input regression test (`:119`) |
+
+**Seams needing only `tempfile` (a real path argument is already the API):**
+- `Store::open(&Path)` — `crates/rustwatch-core/src/db.rs:17`. Runs refinery migrations automatically on open, so a temp DB is immediately schema-complete.
+- `SqliteMemoryStore::open(&Path)` — `crates/rustwatch-memory/src/sqlite_store.rs:27`
+- `GraphStore::open(&Path)` — `crates/rustwatch-memory/src/graph.rs:10`
+- `LanceMemoryStore::open(&Path)` — `crates/rustwatch-memory-backends/src/lance.rs:19`
+- `SurrealGraphStore::open(&Path)` — `crates/rustwatch-memory-backends/src/surreal.rs:13` (in-memory `Mem` engine, so no filesystem actually needed despite the signature)
+
+**Seams needing only a `UnixStream` pair:**
+```rust
+// crates/rustwatch-core/src/ipc.rs:70-73 — the handler is injected, so no daemon required
+pub async fn handle_connection(
+    mut stream: UnixStream,
+    handler: impl Fn(DaemonCommand) -> DaemonReply,
+) -> Result<()>
+```
+Pair it with `DaemonClient::send` (`crates/rustwatch-core/src/ipc.rs:51`) for a full round-trip of every `DaemonCommand`/`DaemonReply` variant with no process spawn. `docs/TESTING_PLAN.md:84-86` calls for exactly this plus a malformed-frame case.
+
+**Seams that work on any OS:**
+- `PlatformCapture::permissions()` on the stub returns a populated report with zero I/O (`crates/rustwatch-capture/src/platform/stub.rs:29-34`). Every fallible stub method returns `Error::UnsupportedPlatform` (`:23-27`, `:44-47`, `:54-58`), which is directly assertable — this is what the planned Ubuntu CI job validates (`docs/TESTING_PLAN.md:114`).
+
+**Seams that need `wiremock`:**
+- `OpenAiClassifier::classify` — `crates/rustwatch-analyze/src/classifier.rs:88`. Request shape at `:90-97`, endpoint and bearer auth at `:99-104`, response extraction at `:110-114`
+- `AnthropicClassifier::classify` — `:138`. Request shape at `:140-146`, `x-api-key` + `anthropic-version: 2023-06-01` headers at `:151-152`, `content[0].text` extraction at `:160`
+- Plan wants 500 / timeout / rate-limit propagation (`docs/TESTING_PLAN.md:89`). `error_for_status()?` at `:106` and `:156` means non-2xx surfaces as `reqwest::Error`.
+
+**Seams that need `assert_cmd` + `predicates`:**
+- MCP stdio JSON-RPC: `initialize` → `tools/list` → `tools/call` (`crates/rustwatch-mcp/src/main.rs:38-59`, `handle_tool` at `:76-112`). All 5 tools are declared at `:46-50`. Plan: `mcp/tests/jsonrpc_stdio.rs` (`docs/TESTING_PLAN.md:92`)
+- CLI smoke: `permissions`, `export`, `chart` against a temp `HOME` (`docs/TESTING_PLAN.md:105`)
+
+**Seam needing `proptest`** (`docs/TESTING_PLAN.md:61-65`):
+- `Redactor::scrub` never panics on arbitrary UTF-8 (char-boundary truncation)
+- `SegmentGrouper` buffer never exceeds `MAX_BUFFER_CHARS` under arbitrary event interleavings
+- `hash_embedding` always normalized for arbitrary strings
+- `DaemonCommand`/`DaemonReply` serde round-trips for arbitrary values
+
+## Blocked Seams — Why Nothing Is Testable Yet
+
+Seven structural blockers. `docs/TESTING_PLAN.md` addresses most of them in Phase 4; doing that work first is what unblocks the test suite.
+
+1. **No `lib.rs` in any binary crate.** `crates/rustwatch-cli/src/main.rs`, `crates/rustwatch-daemon/src/main.rs`, `crates/rustwatch-mcp/src/main.rs` have no library target, so nothing in `tests/` can import them. **Fix:** split each into `lib.rs` + thin `main.rs`. The daemon is explicitly called out (`docs/TESTING_PLAN.md:99-100`).
+   > `crates/rustwatch-daemon` → `src/lib.rs` exporting `pub async fn run_daemon(paths: DataPaths, config: Config)`; `main.rs` keeps only tracing init and the call. The function already exists at `crates/rustwatch-daemon/src/main.rs:30` and just needs `pub` + relocation.
+
+2. **CLI commands print and return `()`.** All 13 functions in `crates/rustwatch-cli/src/commands.rs` return `anyhow::Result<()>` and write directly to stdout via `println!` (21 calls). There is nothing to assert on. **Fix (`docs/TESTING_PLAN.md:101-102`):** return a structured value and let `main` do the printing.
+
+3. **The TUI has no state/render split.** `run_loop` (`crates/rustwatch-cli/src/tui.rs:23-127`) owns terminal state, the `Store` query, the daemon round-trip, widget construction, and the crossterm event loop in one function. **Fix (`docs/TESTING_PLAN.md:103-104`):** extract a `State` struct and `fn render(frame: &Frame, state: &State)`; test with ratatui's `TestBackend`. The plan explicitly leaves the crossterm event loop untested.
+
+4. **`analyze_pending` cannot be given a fake classifier.** The trait exists —
+   ```rust
+   // crates/rustwatch-analyze/src/classifier.rs:8-11
+   #[async_trait]
+   pub trait ActivityClassifier: Send + Sync {
+       async fn classify(&self, batch: SegmentBatch) -> anyhow::Result<Vec<ActivityLabel>>;
+   }
+   ```
+   — but `analyze_pending` constructs its own via `build_classifier(config)` at `:41`, which requires `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in the environment (`:76`, `:126`). **Fix (`docs/TESTING_PLAN.md:78`, named as the Phase 2 prerequisite):** change the signature to accept `&dyn ActivityClassifier`. The `Send + Sync` bound is already there for exactly this reason.
+
+5. **`build_prompt` and the response parsers are private.** `build_prompt` (`crates/rustwatch-analyze/src/classifier.rs:166`) and the JSON extraction at `:110-114` / `:160-163` cannot be reached from a test. **Fix (`docs/TESTING_PLAN.md:46-47`):** mark `pub(crate)` and extract the response parsing into pure functions.
+
+6. **`render_terminal` / `render_html` are private and only reachable through `render_chart(store, ...)`.** `crates/rustwatch-analyze/src/chart.rs:20,42` take `&[ActivityRecord]` and are pure, but `render_chart` (`:11`) demands a `Store`. **Fix (`docs/TESTING_PLAN.md:48`):** publish the render helpers.
+
+7. **`Config` cannot be partially constructed.** No `#[serde(default)]` on any field (`crates/rustwatch-core/src/config.rs:5-59`), and `DataConfig` requires all four path fields. A test must start from `Config::default()` and overwrite nested fields, which also means a test `Config` picks up `~/.rustwatch` defaults it did not ask for. **Fix:** add a `Config::for_test(root: PathBuf)` constructor or `#[serde(default)]`.
+
+**Secondary blockers:**
+- `crates/rustwatch-memory-backends` is not a workspace member (`Cargo.toml:3-11`), so `--workspace` never compiles or tests it. Plan Phase 0 item 4 (`docs/TESTING_PLAN.md:29`).
+- `MemoryChunk`, `ScoredChunk`, and `SearchHit` lack `PartialEq` (`crates/rustwatch-memory/src/sqlite_store.rs:1,14`; `crates/rustwatch-memory/src/rag.rs:34`), so store round-trips must be asserted field-by-field rather than with `assert_eq!`. Add the derive.
+- `CaptureEvent::new` stamps `timestamp: Utc::now()` internally (`crates/rustwatch-core/src/events.rs:59-66`) with no `with_timestamp` alternative, so `SegmentGrouper` tests cannot construct deterministic timestamps. Add a constructor that accepts one.
 
 ## Test File Organization
 
-**Location:**
-
-- **No convention exists.** With zero tests, there is no established place to put them.
-- The Rust-ecosystem default, and what the code structure supports, is co-located `#[cfg(test)] mod tests` at the bottom of each source file — appropriate here because most testable units are private free functions (see "Testability Inventory" below).
-- Integration tests would go in `crates/<name>/tests/<subject>.rs`. None of these directories exist.
-
-**Naming:**
-
-- Nothing to match. If following the default: `tests/db_integration.rs`, `tests/ipc_integration.rs`, snake_case subject prefix.
-
-**Structure:**
+**Current:** none. **Target (per `docs/TESTING_PLAN.md`):** co-located unit tests, separate `tests/` directory for integration.
 
 ```
-crates/
-├── rustwatch-core/
-│   ├── migrations/V1__initial.sql     # embedded via embed_migrations! at db.rs:10
-│   ├── src/
-│   │   ├── db.rs                      # Store — largest testable surface
-│   │   ├── segment.rs                 # SegmentGrouper — pure state machine
-│   │   ├── events.rs                  # serde-tagged wire types
-│   │   ├── error.rs                   # 7-variant thiserror enum
-│   │   ├── config.rs / paths.rs / ipc.rs
-│   │   └── lib.rs
-│   └── (no tests/ dir)
-├── rustwatch-analyze/src/{chart,classifier,redact}.rs
-├── rustwatch-memory/src/{embedder,graph,rag,sqlite_store}.rs
-├── rustwatch-capture/src/{lib,platform/{mod,macos,stub}}.rs
-├── rustwatch-memory-backends/src/{lance,surreal}.rs   # NOT a workspace member — unbuildable
-└── rustwatch-{cli,daemon,mcp}/src/main.rs            # bin-only crates
+crates/<crate>/
+├── src/
+│   └── <module>.rs          # #[cfg(test)] mod tests at the bottom
+└── tests/
+    ├── <name>_integration.rs
+    └── common/
+        └── mod.rs           # shared helpers (does not exist yet)
 ```
+
+Planned file names (`docs/TESTING_PLAN.md:80-93`):
+| Path | Covers |
+|---|---|
+| `crates/rustwatch-core/tests/db_integration.rs` | migrations ran, CRUD, ordering + limit, `stats()`, `list_unanalyzed_segments` LIKE-substring regression |
+| `crates/rustwatch-core/tests/ipc_integration.rs` | real Unix socket, server/client round-trips, malformed frame |
+| `crates/rustwatch-memory/tests/*` | `SqliteMemoryStore` on temp files, FTS5, `GraphStore` persistence, `MemoryEngine` end-to-end |
+| `crates/rustwatch-analyze/tests/classifier_http.rs` | OpenAI + Anthropic request shape, auth headers, 500/timeout/rate-limit |
+| `crates/rustwatch-memory-backends/tests/` | SurrealDB in-mem upsert + expand, LanceDB on-disk create/upsert/search |
+| `crates/rustwatch-mcp/tests/jsonrpc_stdio.rs` | `initialize` → `tools/list` → `tools/call` over stdio |
+
+**Do this:** pure function → `#[cfg(test)] mod tests` at the bottom of its own file. Anything needing a temp dir, a socket, an HTTP stub, or a spawned binary → `crates/<crate>/tests/`. Do not put a `#[cfg(test)]` module in a file you do not own, and do not reach into another module's privates — make them `pub(crate)` instead.
 
 ## Test Structure
 
-**Suite Organization:**
-No examples exist. The structure that fits this codebase:
+**Suite organization (from the plan's intent, `docs/TESTING_PLAN.md:9-10`):** unit tests are named per behavior, not per function. The plan lists them as behavior phrases — "focus-change opens/closes segments", "TextDelta/Paste append order", "TextFieldSnapshot replaces buffer only if shorter", "bytes↔f32 round-trip", "hash_embedding determinism, 384-dim, L2-normalized" — rather than `test_focus_change_1`.
 
+**Do this:**
 ```rust
-// Appended to the bottom of the file under test (e.g. crates/rustwatch-memory/src/rag.rs).
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn focus_event(app_name: &str) -> CaptureEvent {
+        CaptureEvent::new(
+            CaptureEventKind::FocusChange {
+                from: None,
+                to: AppContext {
+                    app_name: app_name.to_string(),
+                    window_title: "title".into(),
+                    process_id: 1,
+                    bundle_id: None,
+                },
+            },
+            None,
+        )
+    }
+
     #[test]
-    fn merge_applies_keyword_boost() {
-        let hits = vec![ScoredChunk {
-            chunk_id: "c1".into(),
-            text: "App: Terminal\nTitle: rustwatch".into(),
-            app_name: "Terminal".into(),
-            score: 0.5,
-        }];
-        let out = GraphRag::merge("rustwatch", hits, Vec::new());
-        assert_eq!(out.len(), 1);
-        // query is a substring of the text → +0.2 boost per rag.rs:11-15
-        assert!((out[0].score - 0.7).abs() < 1e-6, "got {}", out[0].score);
+    fn focus_change_closes_previous_segment_and_opens_a_new_one() {
+        let mut grouper = SegmentGrouper::new();
+        assert!(grouper.on_event(&focus_event("Safari")).is_none());
+
+        let closed = grouper
+            .on_event(&focus_event("Terminal"))
+            .expect("focus change should close the open segment");
+        assert_eq!(closed.app_name, "Safari");
     }
 }
 ```
+Use `use super::*;` — the existing `lib.rs` files make everything in the module reachable that way, and the plan's per-module unit-test phase assumes it.
 
-**Patterns to follow:**
-
-- `use super::*;` inside the module — matches the codebase's reliance on private free helpers (`cosine`, `bytes_to_f32`, `slug`, `key_to_text`) as the natural unit-test targets.
-- Name tests `unit_under_test_behavior` — snake_case, descriptive of the assertion, no `test_` prefix (the codebase uses no prefixes anywhere).
-- Prefer `assert_eq!` on observable outputs; use `assert!` with a format message for float comparisons, since `f32` scores appear throughout (`crates/rustwatch-memory/src/sqlite_store.rs:131`, `crates/rustwatch-memory/src/rag.rs:6`, `crates/rustwatch-memory/src/graph.rs:98`).
-- No `setUp`/`tearDown` concept in Rust. Use `Result<(), E>` return from `#[test]` fns when the body is fallible — `fn t() -> Result<()>` and let `?` work.
-
-**Setup / teardown:**
-
-- No fixture or temp-dir machinery exists. The project has **no `tempfile` dev-dep**, so any test touching `Store::open`, `SqliteMemoryStore::open`, or `GraphStore::open` — all of which write to disk (`crates/rustwatch-core/src/db.rs:17-27`, `crates/rustwatch-memory/src/sqlite_store.rs:27-54`, `crates/rustwatch-memory/src/graph.rs:10-32`) — currently has no way to get an isolated database without either adding `tempfile` or hand-rolling `std::env::temp_dir().join(unique)`.
-- **This is the single biggest blocker for starting the test suite.** Adding `tempfile` to `[workspace.dependencies]` plus a per-crate `[dev-dependencies]` block is the prerequisite for every DB-level test.
+**Behavior-layer tests** are scenario-named with explicit Given/When/Then intent, per `docs/TESTING_PLAN.md:69-77`. The five suites the plan names:
+1. Capture-to-segment lifecycle — synthetic event streams → grouping semantics
+2. Analysis pipeline with a `MockClassifier` — fetch pending, skip excluded apps, scrub before classify, persist activities, mark analyzed (idempotent on a second run)
+3. Memory ingest→search — ranked retrieval; `rebuild_from_store` reproducibility
+4. GraphRag fusion — no duplicate chunks; graph-expanded apps surface related hits
+5. MCP tool contract — all 5 tools, happy path and error paths
 
 ## Mocking
 
-**Framework:** None. No `mockall`, `rstest`, or hand-rolled mock modules exist anywhere in the tree.
+**Framework:** none installed. The plan names `proptest` for properties, `wiremock` for HTTP, and a hand-written `MockClassifier` for the trait (`docs/TESTING_PLAN.md:72`). No `mockall`, `mockito`, or `wiremock`-alternative.
 
-**What could be mocked (and the seams that exist):**
+**The one existing trait seam** is `ActivityClassifier`. Once `analyze_pending` accepts `&dyn ActivityClassifier` (`docs/TESTING_PLAN.md:78`), a mock is three lines:
+```rust
+struct MockClassifier {
+    calls: std::sync::Mutex<Vec<SegmentBatch>>,
+    reply: Vec<ActivityLabel>,
+}
 
-| Seam | Location | Notes |
-|---|---|---|
-| `impl Fn(DaemonCommand) -> DaemonReply` | `crates/rustwatch-core/src/ipc.rs:70-73` | `handle_connection` accepts an injected handler — the codebase's existing DI seam. A sync closure test drives it directly with a `tokio::net::UnixStream`. |
-| `Box<dyn ActivityClassifier>` | `crates/rustwatch-analyze/src/classifier.rs:13-19`, `classifier.rs:8-11` | `build_classifier` returns a boxed trait object, so a mock classifier is the intended substitute. **Blocker:** `analyze_pending(store, config)` (`classifier.rs:21`) constructs the classifier internally from config — it must first gain a parameter accepting `&dyn ActivityClassifier` for injection to work. |
-| `PlatformCapture` behind `cfg` | `crates/rustwatch-capture/src/platform/mod.rs` | `stub.rs` is already a non-functional stand-in returning `Error::UnsupportedPlatform` (`crates/rustwatch-capture/src/platform/stub.rs:23-27,44-47,54-57`). This is a natural test double — build/test on Linux to get it. |
-| HTTP classifier responses | `crates/rustwatch-analyze/src/classifier.rs:99-108` (OpenAI), `:148-158` (Anthropic) | Hardcoded endpoint URLs with `reqwest::Client::new()` built inline in each `::new` (`classifier.rs:79,129`). No base-URL or client injection → requires a real network stub (`wiremock`) plus refactoring the endpoint to be configurable before HTTP contract tests are possible. |
+#[async_trait::async_trait]
+impl ActivityClassifier for MockClassifier {
+    async fn classify(&self, batch: SegmentBatch) -> anyhow::Result<Vec<ActivityLabel>> {
+        self.calls.lock().unwrap().push(batch);
+        Ok(self.reply.clone())
+    }
+}
+```
+The `Send + Sync` supertrait bound on the trait (`crates/rustwatch-analyze/src/classifier.rs:9`) is what makes a `Mutex`-based recorder legal.
+
+**The second seam** needs no mock at all — `handle_connection` takes the handler as a parameter (`crates/rustwatch-core/src/ipc.rs:72`), so a test supplies a `|command| DaemonReply::…` closure directly.
+
+**What to mock:**
+- Only the LLM HTTP boundary, via `wiremock` (`docs/TESTING_PLAN.md:88-89`)
+- Only the classifier trait, via a hand-written `MockClassifier`, once the injection refactor lands
+- The filesystem, via `tempfile::TempDir` passed into the existing `open(path)` constructors — **not** by mocking `std::fs`
+- The daemon, via a real `UnixListener` + `handle_connection` in-process — **not** by mocking `DaemonClient`
 
 **What NOT to mock:**
-
-- Pure functions — `cosine` (`sqlite_store.rs:131`), `bytes_to_f32` (`sqlite_store.rs:124`), `hash_embedding` (`embedder.rs:46`), `slug` (`graph.rs:112` and `surreal.rs:113`), `build_prompt` (`classifier.rs:166`), `append_text`/`truncate` (`segment.rs:106,116`), `expand_tilde` (`paths.rs:58`), `key_to_text`/`scope_label`/`active_modifiers` (`macos.rs:252,348,165`). Test these directly with real inputs; mocking them tests nothing.
-- SQLite. `rusqlite` is bundled and in-process; use a real temp-file database rather than a mocked `Store`.
+- **SQLite.** Every store takes a path and `rusqlite` is bundled. Use a temp file and exercise the real schema and the real migrations — `docs/TESTING_PLAN.md:82-87` calls for this explicitly.
+- **The platform layer.** Do not abstract `PlatformCapture` behind a trait for tests. On non-macOS the `stub.rs` implementation already returns `Error::UnsupportedPlatform`, which is a directly assertable contract (`docs/TESTING_PLAN.md:59`).
+- **Time.** No clock abstraction exists. `Utc::now()` is called in 12 places (`crates/rustwatch-core/src/segment.rs:64`, `crates/rustwatch-core/src/events.rs:62`, `crates/rustwatch-core/src/db.rs:255`, `crates/rustwatch-memory/src/lib.rs:92-97`, …). Do not add a time-travel crate to fix this — instead construct values with explicit timestamps and assert on ranges or on the non-time fields. Note that `parse_ts`'s `Utc::now()` fallback (`crates/rustwatch-core/src/db.rs:255`) makes any bad-timestamp test nondeterministic by design; that is the bug the plan wants pinned (`docs/TESTING_PLAN.md:119`).
 
 ## Fixtures and Factories
 
-**Test Data:** None exists. There are no `fixtures/`, `testdata/`, builder types, or helper modules in any crate.
+**Current:** none exist. No `tests/common/mod.rs`, no builder types, no `#[cfg(test)] mod fixtures`.
 
-**Location:** Would go in `crates/<name>/tests/common/mod.rs` for shared integration fixtures, or inline in the `#[cfg(test)] mod tests` block for unit tests. Neither pattern is established.
+**Test data builders are the missing piece.** Every test that touches storage needs a `CaptureEvent`, a `SessionSegment`, and an `ActivityRecord` with plausible timestamps, and none of those types has a constructor — all three are structs with public fields and no `new` (`crates/rustwatch-core/src/events.rs:70,83`). Only `CaptureEvent::new(kind, app)` exists (`:59`), and it stamps `Utc::now()` internally.
 
-**Construction cost to be aware of:**
-Building a `CaptureEvent` is cheap — `CaptureEvent::new(kind, app)` generates the UUID and timestamp (`crates/rustwatch-core/src/events.rs:59-66`). But that makes `timestamp` non-deterministic, which matters for `SegmentGrouper` (segment boundaries are derived from `event.timestamp` at `crates/rustwatch-core/src/segment.rs:30,72`). Tests over grouping logic will want to construct the struct literal directly with a fixed `DateTime<Utc>` rather than call `new()`.
+**Do this:** add a small fixture module. Put shared builders in `crates/rustwatch-core/src/lib.rs` behind `#[cfg(any(test, feature = "test-util"))]` so every crate's `tests/` can import them, or duplicate a `tests/common/mod.rs` per crate until a `test-util` feature is worth the surface. The plan does not specify a location; pick one and use it consistently.
 
-Note that `CaptureEvent` has no `Default`, and `AppContext` requires four fields (`app_name`, `window_title`, `process_id`, `bundle_id` — `events.rs:6-12`), so a small test-local helper is worth writing rather than repeating the literal.
+Minimum builders needed:
+| Builder | Target type | Why |
+|---|---|---|
+| `focus_event(app)` | `CaptureEvent` | `SegmentGrouper` and capture-loop tests |
+| `text_event(s)` | `CaptureEvent` | buffer append / cap eviction tests |
+| `segment(app, started, ended)` | `SessionSegment` | `Store` and `MemoryEngine` tests |
+| `activity(label, apps, topics)` | `ActivityRecord` | analyze, chart, graph, and MCP tests |
+| `chunk(text)` | `MemoryChunk` | vector-store round-trip tests |
+| `config_for(root)` | `Config` | every test needing filesystem layout — blocked until `Config::for_test` exists |
 
 ## Coverage
 
-**Requirements:** None enforced. No `cargo-llvm-cov` config, no `tarpaulin`, no threshold, no badge.
+**Requirements:** none enforced. No `cargo-tarpaulin`, no `cargo-llvm-cov`, no threshold, no report artifact, no badge.
 
-**View Coverage:**
+**Target (planned, `docs/TESTING_PLAN.md:115`):** llvm-cov with **≥80% on the `rustwatch-core`, `rustwatch-analyze`, and `rustwatch-memory` libraries**. Binaries (`cli`, `daemon`, `mcp`) are excluded from the threshold because their logic currently lives in untestable `main.rs` bodies.
 
+**Where coverage will be worst on day one** — the untestable layers, by design:
+- `crates/rustwatch-capture/src/platform/macos.rs` (359 lines) — macOS-only, needs Input Monitoring + Screen Recording
+- `crates/rustwatch-cli/src/tui.rs` (127 lines) — needs the state/render split
+- `crates/rustwatch-cli/src/commands.rs` (292 lines) — needs structured returns
+- `crates/rustwatch-daemon/src/main.rs` (164 lines) — needs a lib target
+- `crates/rustwatch-memory-backends/` (267 lines) — not a workspace member
+
+**View coverage:**
 ```bash
-
-# Not installed — would require `cargo install cargo-llvm-cov` first.
-
+# NOT INSTALLED — install first
+cargo install cargo-llvm-cov
 cargo llvm-cov --workspace --html
 ```
 
-There is no coverage measurement of the current code, and no CI to publish one.
+## Known Risks Tests Should Pin
 
-## Test Types
+The plan names four (`docs/TESTING_PLAN.md:117-122`). Each is a real, verifiable defect in the current code — write a test for each before changing the code, so the test documents the bug and then confirms the fix.
 
-All four categories are absent.
+1. **`parse_ts` silently falls back to `Utc::now()` on bad input** — `crates/rustwatch-core/src/db.rs:252-256`. A corrupt timestamp column becomes "now", which silently corrupts timeline queries instead of surfacing an error.
+2. **`String::truncate` panics on a char boundary in `Redactor::scrub`** — `crates/rustwatch-analyze/src/redact.rs:30-32`. `out.truncate(self.max_chars)` slices at a byte offset and will panic whenever `max_chars` lands inside a multi-byte character. Reachable from any captured text containing non-ASCII. `proptest` over arbitrary UTF-8 will find it immediately (`docs/TESTING_PLAN.md:62`).
+3. **`expand_around_apps(hops)` uses `hops` as a SQL `LIMIT`, not BFS depth** — `crates/rustwatch-memory/src/graph.rs:80,87` (`let limit = hops.max(1) as i64;` bound to `LIMIT ?2`). The config field is named `graph_expand_hops` (`crates/rustwatch-core/src/config.rs:46`), so the name and the behavior disagree. The plan says document it (`docs/TESTING_PLAN.md:121`); the same bug exists in the SurrealDB copy (`crates/rustwatch-memory-backends/src/surreal.rs:87`).
+4. **`list_unanalyzed_segments` LIKE-substring matching can cross-match ids** — `crates/rustwatch-core/src/db.rs:161`, `a.segment_ids_json LIKE '%' || s.id || '%'`. A segment id that is a substring of a different id is treated as already analyzed. The plan wants a regression test specifically for this (`docs/TESTING_PLAN.md:83`).
 
-**Unit Tests:** 0. The highest-value untested targets are the pure functions listed in "Mocking" above plus `SegmentGrouper` (`crates/rustwatch-core/src/segment.rs:23-82`), `Redactor` (`crates/rustwatch-analyze/src/redact.rs`), `GraphRag::merge` (`crates/rustwatch-memory/src/rag.rs`), and `Store::new_activity_id` (`db.rs:247`).
-
-**Integration Tests:** 0. Uncovered seams that need real resources: SQLite migrations + CRUD via `Store::open` (`crates/rustwatch-core/src/db.rs:10,17`); the `refinery` embedded migration runner; real Unix socket round-trip through `DaemonClient::send` / `handle_connection` (`crates/rustwatch-core/src/ipc.rs:51,70`); FTS5 table creation in `SqliteMemoryStore::open` (`crates/rustwatch-memory/src/sqlite_store.rs:45`).
-
-**E2E Tests:** None. No `assert_cmd` harness exists for the three binaries.
-
-**Property-based tests:** None. No `proptest` or `quickcheck`.
-
-## Blocker: Bin-Only Crates
-
-`rustwatch-cli`, `rustwatch-daemon`, and `rustwatch-mcp` have **no lib target** — only `[[bin]] name/path = "src/main.rs"` (`crates/rustwatch-cli/Cargo.toml:11-13`, `crates/rustwatch-daemon/Cargo.toml:11-13`, `crates/rustwatch-mcp/Cargo.toml:11-13`). Everything lives in `main.rs`, including non-trivial private helpers:
-
-- `parse_opt_ts` — `crates/rustwatch-cli/src/commands.rs:287-292`
-- `flag` — `crates/rustwatch-cli/src/commands.rs:120-126`
-- `handle_tool` — `crates/rustwatch-mcp/src/main.rs:76-112`
-- `tool` — `crates/rustwatch-mcp/src/main.rs:68-74`
-- `daemon_text` — `crates/rustwatch-mcp/src/main.rs:114-122`
-- `run_daemon` — `crates/rustwatch-daemon/src/main.rs:30`
-- `run_loop` (TUI) — `crates/rustwatch-cli/src/tui.rs:23`
-
-A `#[cfg(test)] mod tests` **can** live inside a `main.rs` and will run, so unit tests there are possible today. Integration tests (`tests/`) are **not** — they cannot import from a bin-only crate. Adding a `src/lib.rs` to these crates is a prerequisite for any integration or E2E test.
-
-## Blocker: `rustwatch-memory-backends` Is Unbuildable
-
-`crates/rustwatch-memory-backends` is **not** listed in `[workspace] members` in the root `Cargo.toml:3-11`, and it is not in `workspace.exclude` either. Building it fails outright:
-
-```
-$ cd crates/rustwatch-memory-backends && cargo metadata --no-deps
-error: current package believes it's in a workspace when it's not
-```
-
-Its deps (`lancedb`, `surrealdb`, `arrow-array`, `arrow-schema`, `futures`) are absent from `Cargo.lock` and have never been resolved or built. `cargo test` cannot reach `crates/rustwatch-memory-backends/src/lance.rs` or `surreal.rs` until the crate is added to `workspace.members` or given an empty `[workspace]` table. The `--manifest-path` build command in `README.md` does not work as written.
-
-## Known Risky Code With No Test Protection
-
-These are the spots where a bug is currently invisible. Each is untested *and* unlogged.
-
-| Risk | Location | Why it matters |
-|---|---|---|
-| `parse_ts` silently falls back to `Utc::now()` | `crates/rustwatch-core/src/db.rs:252-256` | A malformed stored timestamp silently rewrites history to "now" on every read. No error, no log. |
-| `String::truncate` on a non-char-boundary index | `crates/rustwatch-analyze/src/redact.rs:30-31` | Panics if `chunk_max_chars` lands mid-UTF-8-sequence. Only reachable when `len() > max_chars`. |
-| `LIKE '%' \|\| s.id \|\| '%'` substring join | `crates/rustwatch-core/src/db.rs:161` | Segment id `abc` matches activity `xabcx`. Cross-matches silently, producing wrong "unanalyzed" results. |
-| `expand_around_apps` uses `hops` as a SQL row `LIMIT` | `crates/rustwatch-memory/src/graph.rs:80-88` | Not a BFS depth. Named as if it were. |
-| Silent event loss in the daemon writer loop | `crates/rustwatch-daemon/src/main.rs:63,65,81` | `let _ = store.insert_event(&event);` — a DB error drops captured user activity with no log line. |
-| `try_lock` failure silently skips the write | `crates/rustwatch-daemon/src/main.rs:62,80,126` | Lock contention means dropped events; only the `Tail` path reports `"store locked"`. |
-| `Redactor::scrub` never panics guarantee | `crates/rustwatch-analyze/src/redact.rs:25-34` | Not verifiable without property-based testing over arbitrary UTF-8. |
-| `sqlite_store::search` is a full table scan | `crates/rustwatch-memory/src/sqlite_store.rs:86-115` | Loads every row and computes cosine in Rust. Correctness is easy to reason about; performance is untested at any scale. |
-
-## Testability Inventory
-
-Existing structure that makes a test suite tractable, with no refactor needed:
-
-- **Pure private functions** (14 identified above) — directly testable from a co-located `#[cfg(test)] mod tests` via `use super::*`.
-- **`SegmentGrouper`** (`crates/rustwatch-core/src/segment.rs`) — a self-contained state machine with no I/O. Only dependency is `Utc::now()` in `flush()` (`segment.rs:64`), which is avoidable by testing `on_event` and the private `on_focus`.
-- **`GraphRag::merge`** (`crates/rustwatch-memory/src/rag.rs`) — pure function over two `Vec<ScoredChunk>`; a struct with no state (`pub struct GraphRag;`).
-- **`Redactor`** (`crates/rustwatch-analyze/src/redact.rs`) — constructed from a `&Config`, no I/O. `Config::default()` at `crates/rustwatch-core/src/config.rs:61` supplies patterns, exclusions, and limits without touching the filesystem.
-- **`Store`** (`crates/rustwatch-core/src/db.rs`) — takes an explicit `&Path` in `open()`, so a temp-dir path is all that is needed to test it.
-- **Serde round-trips** — every wire type derives `Serialize + Deserialize` with explicit tags (`events.rs:15`, `ipc.rs:20,31`), so round-trip tests need no setup.
-- **Conditional platform double** — `crates/rustwatch-capture/src/platform/stub.rs` provides a real, deterministic stand-in for `PlatformCapture`.
-
-Requires refactoring before it is testable:
-
-- `analyze_pending` constructs its own classifier from `Config` (`crates/rustwatch-analyze/src/classifier.rs:41`) instead of accepting one.
-- `OpenAiClassifier` / `AnthropicClassifier` hardcode their endpoint URLs and construct `reqwest::Client::new()` internally (`classifier.rs:79,101,129,151`) — no base-URL or client injection.
-- The TUI event loop (`crates/rustwatch-cli/src/tui.rs:23-126`) mixes state, rendering, and crossterm input in one function with no separable `render(frame, state)`.
-- The daemon command handler is an inline closure inside the accept loop (`crates/rustwatch-daemon/src/main.rs:102-157`) rather than an extractable function.
-- CLI `commands::*` functions print directly to stdout rather than returning structured values (`crates/rustwatch-cli/src/commands.rs` throughout).
-
-## Planned, Not Implemented
-
-`docs/TESTING_PLAN.md` (127 lines) proposes a four-layer strategy — unit, behavior, integration, HTTP contract — with `proptest`, `tempfile`, `wiremock`, `assert_cmd`, `predicates`, `cargo-nextest`, and `.github/workflows/test.yml`. Its Phase 0 checklist (dev-deps, nextest config, CI, adding `rustwatch-memory-backends` to the workspace) is **entirely unstarted**: none of those files, sections, or settings exist.
-
-The plan's own "Known Risks" section already names four of the bugs listed above, and its Phase 4 correctly identifies the lib+bin split as a prerequisite for daemon/CLI/TUI testing.
-
-**Do not treat this file as a convention to match — there is no code implementing any part of it.** When tests are first written, treat the plan as a candidate roadmap to be validated, not as a spec.
+Additional risks found while reading the code, not yet in the plan:
+- **`Store::list_activities_for_date` unwraps twice** — `crates/rustwatch-core/src/db.rs:183-184`. Safe for valid clock times today, but it is an unguarded `unwrap` on the storage read path.
+- **The daemon silently drops captured events on `try_lock` contention and on write failure** — `crates/rustwatch-daemon/src/main.rs:62-81`. `events_captured` increments before the write is attempted, so the counter reports captures that never reached disk.
+- **`slug` is duplicated verbatim** between `crates/rustwatch-memory/src/graph.rs:112-123` and `crates/rustwatch-memory-backends/src/surreal.rs:113-124`. Test both or, better, extract one into `rustwatch-memory` and test it once.
+- **`analyze_pending` attaches every filtered segment id to every returned label** — `crates/rustwatch-analyze/src/classifier.rs:60`. Every label claims all segments regardless of what the classifier matched.
 
 ---
 
