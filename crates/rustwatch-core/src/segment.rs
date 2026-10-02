@@ -29,6 +29,7 @@ impl SegmentGrouper {
         match &event.kind {
             CaptureEventKind::FocusChange { to, .. } => self.on_focus(to.clone(), event.timestamp),
             CaptureEventKind::TextDelta { text } => {
+                self.ensure_segment(event);
                 if let Some(active) = &mut self.current {
                     append_text(&mut active.text_buffer, text);
                     active.event_count += 1;
@@ -36,6 +37,7 @@ impl SegmentGrouper {
                 None
             }
             CaptureEventKind::Paste { content } => {
+                self.ensure_segment(event);
                 if let Some(active) = &mut self.current {
                     append_text(&mut active.text_buffer, content);
                     active.event_count += 1;
@@ -43,6 +45,7 @@ impl SegmentGrouper {
                 None
             }
             CaptureEventKind::TextFieldSnapshot { value } => {
+                self.ensure_segment(event);
                 if let Some(active) = &mut self.current {
                     if !value.is_empty() && active.text_buffer.len() < value.len() {
                         active.text_buffer = truncate(value);
@@ -58,6 +61,30 @@ impl SegmentGrouper {
                 None
             }
         }
+    }
+
+    /// Open a segment if none is active.
+    ///
+    /// The focus loop polls, so keystrokes can arrive before the first
+    /// `FocusChange` — or after a focus change that was suppressed because the
+    /// app is excluded. Without this, that text is silently dropped.
+    fn ensure_segment(&mut self, event: &CaptureEvent) {
+        if self.current.is_some() {
+            return;
+        }
+        let app = event.app.clone().unwrap_or_else(|| AppContext {
+            app_name: "unknown".into(),
+            window_title: String::new(),
+            process_id: 0,
+            bundle_id: None,
+        });
+        self.current = Some(ActiveSegment {
+            id: Uuid::new_v4().to_string(),
+            app,
+            text_buffer: String::new(),
+            started_at: event.timestamp,
+            event_count: 0,
+        });
     }
 
     pub fn flush(&mut self) -> Option<SessionSegment> {
@@ -103,11 +130,35 @@ impl ActiveSegment {
     }
 }
 
+/// Append `text`, trimming from the front to stay under `MAX_BUFFER_CHARS`.
+///
+/// Trims on a char boundary: slicing at an arbitrary byte offset panics on
+/// multi-byte UTF-8, which would kill the daemon's only writer task.
 fn append_text(buffer: &mut String, text: &str) {
+    // A single chunk larger than the cap: keep only its tail, which is the
+    // most recent input. Round down to a char boundary so we never split a
+    // multi-byte character.
+    let text = if text.len() > MAX_BUFFER_CHARS {
+        let mut start = text.len() - MAX_BUFFER_CHARS;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        &text[start..]
+    } else {
+        text
+    };
+
     if buffer.len() + text.len() > MAX_BUFFER_CHARS {
         let keep = MAX_BUFFER_CHARS.saturating_sub(text.len());
         if keep < buffer.len() {
-            buffer.replace_range(..buffer.len() - keep, "");
+            let drop = buffer.len() - keep;
+            // Round *up* to the next char boundary: trimming back instead would
+            // remove fewer bytes than required and leave the buffer over cap.
+            let mut start = drop.min(buffer.len());
+            while start < buffer.len() && !buffer.is_char_boundary(start) {
+                start += 1;
+            }
+            buffer.replace_range(..start, "");
         }
     }
     buffer.push_str(text);
@@ -115,4 +166,181 @@ fn append_text(buffer: &mut String, text: &str) {
 
 fn truncate(value: &str) -> String {
     value.chars().take(MAX_BUFFER_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SegmentGrouper, MAX_BUFFER_CHARS};
+    use crate::events::{AppContext, CaptureEvent, CaptureEventKind};
+
+    fn app(name: &str) -> AppContext {
+        AppContext {
+            app_name: name.to_string(),
+            window_title: format!("{name} window"),
+            process_id: 42,
+            bundle_id: Some(format!("com.example.{name}")),
+        }
+    }
+
+    fn text_delta(t: &str) -> CaptureEvent {
+        CaptureEvent::new(
+            CaptureEventKind::TextDelta {
+                text: t.to_string(),
+            },
+            Some(app("Safari")),
+        )
+    }
+
+    fn focus(to: &str) -> CaptureEvent {
+        CaptureEvent::new(
+            CaptureEventKind::FocusChange {
+                from: None,
+                to: app(to),
+            },
+            Some(app(to)),
+        )
+    }
+
+    /// Regression: text arriving before any FocusChange used to be dropped,
+    /// because only FocusChange opened a segment and the focus loop polls.
+    #[test]
+    fn text_before_any_focus_change_is_not_lost() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("hello"));
+        g.on_event(&text_delta(" world"));
+        let seg = g.flush().expect("segment should exist");
+
+        assert_eq!(seg.text_buffer, "hello world");
+        assert_eq!(seg.event_count, 2);
+        assert_eq!(seg.app_name, "Safari");
+    }
+
+    #[test]
+    fn paste_before_focus_change_is_not_lost() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&CaptureEvent::new(
+            CaptureEventKind::Paste {
+                content: "pasted".into(),
+            },
+            Some(app("Safari")),
+        ));
+        let seg = g.flush().expect("segment should exist");
+        assert_eq!(seg.text_buffer, "pasted");
+    }
+
+    #[test]
+    fn snapshot_before_focus_change_is_not_lost() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&CaptureEvent::new(
+            CaptureEventKind::TextFieldSnapshot {
+                value: "snapshot value".into(),
+            },
+            Some(app("Safari")),
+        ));
+        let seg = g.flush().expect("segment should exist");
+        assert_eq!(seg.text_buffer, "snapshot value");
+    }
+
+    #[test]
+    fn text_with_no_app_context_still_lands() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&CaptureEvent::new(
+            CaptureEventKind::TextDelta {
+                text: "orphan".into(),
+            },
+            None,
+        ));
+        let seg = g.flush().expect("segment should exist");
+        assert_eq!(seg.text_buffer, "orphan");
+        assert_eq!(seg.app_name, "unknown");
+    }
+
+    /// An excluded app produces no FocusChange, so its keystrokes arrive with
+    /// no open segment. They must still be attributed, not silently dropped.
+    #[test]
+    fn keystrokes_after_suppressed_focus_change_are_attributed() {
+        let mut g = SegmentGrouper::new();
+        // 1Password is excluded, so run_focus_loop never emitted a FocusChange.
+        g.on_event(&text_delta("hunter2"));
+        let seg = g.flush().expect("segment should exist");
+        assert_eq!(seg.text_buffer, "hunter2");
+        assert_eq!(seg.app_name, "Safari");
+    }
+
+    #[test]
+    fn focus_change_still_splits_segments() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("in safari"));
+        let closed = g.on_event(&focus("Terminal")).expect("previous closed");
+
+        assert_eq!(closed.text_buffer, "in safari");
+        assert_eq!(closed.app_name, "Safari");
+
+        g.on_event(&text_delta("in terminal"));
+        let seg = g.flush().expect("segment should exist");
+        assert_eq!(seg.text_buffer, "in terminal");
+        assert_eq!(seg.app_name, "Terminal");
+    }
+
+    #[test]
+    fn ensure_segment_does_not_reopen_an_active_segment() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("a"));
+        g.on_event(&text_delta("b"));
+        g.on_event(&text_delta("c"));
+        let seg = g.flush().expect("segment");
+        assert_eq!(seg.text_buffer, "abc");
+        assert_eq!(seg.event_count, 3);
+    }
+
+    #[test]
+    fn buffer_trims_from_front_and_stays_bounded() {
+        let mut g = SegmentGrouper::new();
+        let chunk = "x".repeat(1000);
+        for _ in 0..40 {
+            g.on_event(&text_delta(&chunk));
+        }
+        let seg = g.flush().expect("segment");
+        assert!(
+            seg.text_buffer.len() <= MAX_BUFFER_CHARS,
+            "buffer grew to {} > {MAX_BUFFER_CHARS}",
+            seg.text_buffer.len()
+        );
+    }
+
+    /// Regression: append_text sliced at a byte offset, panicking on
+    /// multi-byte UTF-8 and killing the daemon's only writer task.
+    #[test]
+    fn multibyte_trim_does_not_panic_and_stays_valid_utf8() {
+        let mut g = SegmentGrouper::new();
+        // Seed with multi-byte characters so any byte-offset trim lands mid-char.
+        for _ in 0..30 {
+            g.on_event(&text_delta(&"日".repeat(900)));
+        }
+        let seg = g.flush().expect("segment");
+        assert!(seg.text_buffer.len() <= MAX_BUFFER_CHARS);
+        // Valid UTF-8 by construction; assert it round-trips.
+        assert!(std::str::from_utf8(seg.text_buffer.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn mixed_ascii_and_multibyte_trim_is_safe() {
+        let mut g = SegmentGrouper::new();
+        for i in 0..40 {
+            if i % 2 == 0 {
+                g.on_event(&text_delta(&"a".repeat(800)));
+            } else {
+                g.on_event(&text_delta(&"é日".repeat(400)));
+            }
+        }
+        let seg = g.flush().expect("segment");
+        assert!(seg.text_buffer.len() <= MAX_BUFFER_CHARS);
+        assert!(std::str::from_utf8(seg.text_buffer.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn flush_on_empty_grouper_returns_none() {
+        let mut g = SegmentGrouper::new();
+        assert!(g.flush().is_none());
+    }
 }
