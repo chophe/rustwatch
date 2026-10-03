@@ -31,12 +31,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. User sees correct Input Monitoring / Accessibility / Screen Recording permission states with onboarding guidance, and a missing grant degrades that capture path gracefully instead of capturing nothing silently
   4. Starting a second daemon instance exits with a clear message; `doctor`/`status` confirms launchd installed, daemon running, and DB writable
   5. Every `config.toml` field either works or is removed — no dead knobs; unknown keys warn at startup
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: Loss-free ledger + daemon hardening (blocking writer, busy_timeout/WAL, Unicode panic fixes, SIGTERM flush, single-instance lock, socket hardening)
-- [ ] 01-02: Screenshot triggers + idle detection (interval, window-change, hotkey-annotate, sleep/wake, CGEventSource idle)
-- [ ] 01-03: Permissions onboarding + config honesty + launchd doctor/status
+- [ ] 01-01-PLAN.md — Loss-free ledger + daemon hardening + config honesty (CAPT-01, CAPT-05, SYS-01)
+- [ ] 01-02-PLAN.md — Screenshot triggers + idle detection + hotkey annotate (CAPT-02, CAPT-03, CAPT-04, CAPT-07)
+- [ ] 01-03-PLAN.md — Permissions onboarding + launchd doctor/status (CAPT-06, SYS-02)
 
 ### Phase 2: Privacy Enforcement
 **Goal**: Privacy controls are enforced at every path — secrets never persist or egress, excluded apps are never recorded, capture can be paused, screenshots stay local by default
