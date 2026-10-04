@@ -8,7 +8,7 @@ pub mod paths;
 pub mod segment;
 
 pub use config::Config;
-pub use db::Store;
+pub use db::{is_retryable_db_error, is_retryable_store_error, RetryQueue, Store, RETRY_QUEUE_CAP};
 pub use error::{Error, Result};
 pub use events::*;
 pub use ipc::{DaemonClient, DaemonCommand, DaemonReply, DaemonState};

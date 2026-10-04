@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use rustwatch_core::{CaptureEvent, Result, ScreenshotScope};
-use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsReport {
@@ -35,7 +34,7 @@ impl PlatformCapture {
 
     pub fn start(
         &self,
-        _tx: UnboundedSender<CaptureEvent>,
+        _tx: std::sync::mpsc::Sender<CaptureEvent>,
         _poll_focus_ms: u64,
         _accessibility_poll_ms: u64,
         _screenshot_on_focus_change: bool,
@@ -57,4 +56,9 @@ impl PlatformCapture {
     }
 
     pub fn set_paused(&self, _paused: bool) {}
+
+    pub fn threads_alive(&self) -> bool {
+        // The stub never spawns threads; nothing to watch.
+        true
+    }
 }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use rustwatch_core::{
@@ -9,8 +9,9 @@ use rustwatch_core::{
     is_excluded, key_to_text, LogicalKey, Modifiers, Result,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
+
+pub type EventSender<T> = std::sync::mpsc::Sender<T>;
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsReport {
@@ -23,6 +24,9 @@ pub struct PermissionsReport {
 pub struct PlatformCapture {
     exclude_apps: Vec<String>,
     paused: Arc<AtomicBool>,
+    /// D-06: join handles for the capture threads. The daemon watches them
+    /// and exits nonzero if any dies, so launchd KeepAlive restarts it.
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl Clone for PlatformCapture {
@@ -30,6 +34,7 @@ impl Clone for PlatformCapture {
         Self {
             exclude_apps: self.exclude_apps.clone(),
             paused: Arc::clone(&self.paused),
+            threads: Arc::clone(&self.threads),
         }
     }
 }
@@ -39,7 +44,18 @@ impl PlatformCapture {
         Ok(Self {
             exclude_apps,
             paused: Arc::new(AtomicBool::new(false)),
+            threads: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// D-06: true while every capture thread spawned by `start` is still
+    /// running. Any finished thread (panic or early return) reads as dead —
+    /// capture loops run forever by design.
+    pub fn threads_alive(&self) -> bool {
+        self.threads
+            .lock()
+            .map(|handles| handles.iter().all(|h| !h.is_finished()))
+            .unwrap_or(false)
     }
 
     pub fn permissions() -> PermissionsReport {
@@ -56,7 +72,7 @@ impl PlatformCapture {
 
     pub fn start(
         &self,
-        tx: UnboundedSender<CaptureEvent>,
+        tx: EventSender<CaptureEvent>,
         poll_focus_ms: u64,
         _accessibility_poll_ms: u64,
         screenshot_on_focus_change: bool,
@@ -68,24 +84,36 @@ impl PlatformCapture {
 
         let exclude_kb = exclude.clone();
         let tx_focus = tx.clone();
-        std::thread::spawn(move || {
-            if let Err(err) = run_keyboard_loop(tx, paused_kb, exclude_kb) {
-                warn!(?err, "keyboard capture stopped");
-            }
-        });
+        let threads = Arc::clone(&self.threads);
+        let keyboard = std::thread::Builder::new()
+            .name("capture-keyboard".into())
+            .spawn(move || {
+                if let Err(err) = run_keyboard_loop(tx, paused_kb, exclude_kb) {
+                    warn!(?err, "keyboard capture stopped");
+                }
+            })
+            .map_err(|e| rustwatch_core::Error::Other(format!("spawn keyboard thread: {e}")))?;
 
-        std::thread::spawn(move || {
-            if let Err(err) = run_focus_loop(
-                tx_focus,
-                poll_focus_ms,
-                screenshot_on_focus_change,
-                screenshot_root,
-                exclude,
-                paused_focus,
-            ) {
-                warn!(?err, "focus capture stopped");
-            }
-        });
+        let focus = std::thread::Builder::new()
+            .name("capture-focus".into())
+            .spawn(move || {
+                if let Err(err) = run_focus_loop(
+                    tx_focus,
+                    poll_focus_ms,
+                    screenshot_on_focus_change,
+                    screenshot_root,
+                    exclude,
+                    paused_focus,
+                ) {
+                    warn!(?err, "focus capture stopped");
+                }
+            })
+            .map_err(|e| rustwatch_core::Error::Other(format!("spawn focus thread: {e}")))?;
+
+        threads
+            .lock()
+            .map_err(|_| rustwatch_core::Error::Other("capture thread registry poisoned".into()))?
+            .extend([keyboard, focus]);
 
         Ok(())
     }
@@ -132,7 +160,7 @@ impl KeyEventSource for KeytapSource {
 fn translate_key_events<A, C>(
     raw: &[(bool, keytap::Key)],
     state: &mut KeyState,
-    tx: &UnboundedSender<CaptureEvent>,
+    tx: &EventSender<CaptureEvent>,
     exclude_apps: &[String],
     resolve_app: &A,
     read_clipboard: &C,
@@ -250,7 +278,7 @@ impl KeyState {
 }
 
 fn run_keyboard_loop(
-    tx: UnboundedSender<CaptureEvent>,
+    tx: EventSender<CaptureEvent>,
     paused: Arc<AtomicBool>,
     exclude_apps: Vec<String>,
 ) -> anyhow::Result<()> {
@@ -280,7 +308,7 @@ fn run_keyboard_loop(
 }
 
 fn run_focus_loop(
-    tx: UnboundedSender<CaptureEvent>,
+    tx: EventSender<CaptureEvent>,
     poll_focus_ms: u64,
     screenshot_on_focus_change: bool,
     screenshot_root: PathBuf,
@@ -513,7 +541,7 @@ mod tests {
     /// Drive the real translation pipeline with a scripted key sequence.
     /// No tap, no Accessibility grant, no physical keyboard.
     fn run(raw: &[(bool, Key)], exclude: &[&str], app_name: &str) -> Vec<CaptureEvent> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CaptureEvent>();
+        let (tx, rx) = std::sync::mpsc::channel::<CaptureEvent>();
         let mut state = KeyState::default();
         let exclude: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
         let ctx = app(app_name);
@@ -730,7 +758,7 @@ mod tests {
 
     #[test]
     fn meta_v_emits_paste_from_injected_clipboard() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CaptureEvent>();
+        let (tx, rx) = std::sync::mpsc::channel::<CaptureEvent>();
         let mut state = KeyState::default();
         let ctx = app("Safari");
         super::translate_key_events(

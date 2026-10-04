@@ -28,7 +28,7 @@ impl CaptureHandle {
 
     pub fn start(
         &self,
-        tx: tokio::sync::mpsc::UnboundedSender<CaptureEvent>,
+        tx: std::sync::mpsc::Sender<CaptureEvent>,
         poll_focus_ms: u64,
         accessibility_poll_ms: u64,
         screenshot_on_focus_change: bool,
@@ -49,6 +49,12 @@ impl CaptureHandle {
 
     pub fn set_paused(&self, paused: bool) {
         self.inner.set_paused(paused);
+    }
+
+    /// D-06: the daemon watches this and exits nonzero when a capture
+    /// thread dies, so launchd KeepAlive restarts it.
+    pub fn threads_alive(&self) -> bool {
+        self.inner.threads_alive()
     }
 
     pub fn permissions() -> PermissionsReport {

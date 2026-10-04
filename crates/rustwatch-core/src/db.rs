@@ -80,6 +80,17 @@ impl RetryQueue {
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
+
+    /// D-05: shutdown drain counts the undrained remainder as dropped.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Take (and reset) the overflow-drop count so the daemon can fold it
+    /// into the shared `dropped_events` counter exactly once per drain.
+    pub fn take_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped)
+    }
 }
 
 impl Default for RetryQueue {
@@ -356,4 +367,87 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureEvent> {
         app,
         kind,
     })
+}
+
+#[cfg(test)]
+mod retry_queue_tests {
+    use super::*;
+    use crate::events::CaptureEventKind;
+
+    fn synthetic_event() -> CaptureEvent {
+        CaptureEvent::new(
+            CaptureEventKind::TextDelta {
+                text: "x".to_string(),
+            },
+            None,
+        )
+    }
+
+    fn sqlite_failure(code: rusqlite::ffi::ErrorCode) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            None,
+        )
+    }
+
+    /// D-04: only SQLITE_BUSY / IO retry; everything else is poison.
+    #[test]
+    fn retryable_vs_fatal_classification() {
+        assert!(is_retryable_db_error(&sqlite_failure(
+            rusqlite::ffi::ErrorCode::DatabaseBusy
+        )));
+        assert!(is_retryable_db_error(&sqlite_failure(
+            rusqlite::ffi::ErrorCode::SystemIoFailure
+        )));
+        // Constraint violations (e.g. duplicate id) and lock errors must
+        // never loop on the 500 ms timer.
+        assert!(!is_retryable_db_error(&sqlite_failure(
+            rusqlite::ffi::ErrorCode::ConstraintViolation
+        )));
+        assert!(!is_retryable_db_error(&sqlite_failure(
+            rusqlite::ffi::ErrorCode::DatabaseLocked
+        )));
+        assert!(!is_retryable_db_error(&rusqlite::Error::InvalidPath(
+            "gone".into()
+        )));
+        // Store-level: Io (disk hiccup under WAL) retries; config/other never.
+        assert!(is_retryable_store_error(&crate::Error::Db(sqlite_failure(
+            rusqlite::ffi::ErrorCode::DatabaseBusy
+        ))));
+        assert!(is_retryable_store_error(&crate::Error::Db(sqlite_failure(
+            rusqlite::ffi::ErrorCode::ConstraintViolation
+        ))) == false);
+        assert!(is_retryable_store_error(&crate::Error::Config(
+            "bad".into()
+        )) == false);
+    }
+
+    /// D-04: bounded at cap, overflow drops oldest and counts it — never
+    /// unbounded, never silent.
+    #[test]
+    fn drop_oldest_accounting_at_cap() {
+        let mut queue = RetryQueue::with_cap(3);
+        for _ in 0..5 {
+            queue.push(synthetic_event());
+        }
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.dropped(), 2);
+        // take_dropped folds into the daemon counter exactly once.
+        assert_eq!(queue.take_dropped(), 2);
+        assert_eq!(queue.take_dropped(), 0);
+    }
+
+    /// Flushing an empty queue is a no-op: no pops, no drops, no panic.
+    #[test]
+    fn flush_on_empty_is_noop() {
+        let mut queue = RetryQueue::new();
+        assert!(queue.is_empty());
+        assert!(queue.pop_front().is_none());
+        assert_eq!(queue.take_dropped(), 0);
+        queue.clear();
+        assert!(queue.is_empty());
+    }
 }
