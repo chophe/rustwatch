@@ -9,11 +9,11 @@ Requirements for hardened v1. Each maps to roadmap phases.
 
 ### Capture
 
-- [ ] **CAPT-01**: User can run daemon that captures keystroke context + active app/window titles continuously on macOS
+- [x] **CAPT-01**: User can run daemon that captures keystroke context + active app/window titles continuously on macOS
 - [ ] **CAPT-02**: User gets screenshots every 5 minutes (configurable interval) during active use
 - [ ] **CAPT-03**: User gets a screenshot on every window/app change
 - [ ] **CAPT-04**: User can press a global hotkey to capture screen + attach an annotation note to today's log in under 200ms visible feedback
-- [ ] **CAPT-05**: Daemon survives sleep/wake, never panics on non-ASCII/CJK/emoji input, and never silently drops events (no try_lock-and-drop loss)
+- [x] **CAPT-05**: Daemon survives sleep/wake, never panics on non-ASCII/CJK/emoji input, and never silently drops events (no try_lock-and-drop loss)
 - [ ] **CAPT-06**: User sees correct macOS permission states (Input Monitoring, Accessibility, Screen Recording) with onboarding guidance and per-grant graceful degradation
 - [ ] **CAPT-07**: Idle time is detected and excluded from active segments so reports never count lunch/coffee as work
 
@@ -51,7 +51,7 @@ Requirements for hardened v1. Each maps to roadmap phases.
 
 ### System
 
-- [ ] **SYS-01**: Every config.toml field is wired or removed — no dead knobs (vector_backend, batch_interval, send_screenshots_to_llm, ui flags); single-instance daemon lock with clear second-instance message
+- [x] **SYS-01**: Every config.toml field is wired or removed — no dead knobs (vector_backend, batch_interval, send_screenshots_to_llm, ui flags); single-instance daemon lock with clear second-instance message
 - [ ] **SYS-02**: User can run launchd auto-start with a doctor/status check confirming installed + running + DB writable
 
 ## v2 Requirements
@@ -88,11 +88,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CAPT-01 | Phase 1 | Pending |
+| CAPT-01 | Phase 1 | Complete |
 | CAPT-02 | Phase 1 | Pending |
 | CAPT-03 | Phase 1 | Pending |
 | CAPT-04 | Phase 1 | Pending |
-| CAPT-05 | Phase 1 | Pending |
+| CAPT-05 | Phase 1 | Complete |
 | CAPT-06 | Phase 1 | Pending |
 | CAPT-07 | Phase 1 | Pending |
 | PRIV-01 | Phase 2 | Pending |
@@ -112,10 +112,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DASH-02 | Phase 5 | Pending |
 | DASH-03 | Phase 5 | Pending |
 | DASH-04 | Phase 5 | Pending |
-| SYS-01 | Phase 1 | Pending |
+| SYS-01 | Phase 1 | Complete |
 | SYS-02 | Phase 1 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 26 total
 - Mapped to phases: 26
 - Unmapped: 0
