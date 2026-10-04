@@ -6,10 +6,10 @@ use comfy_table::{Cell, Table};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use rustwatch_analyze::{analyze_pending, render_chart, ChartFormat};
+use rustwatch_analyze::{analyze_pending, render_chart, ChartFormat, Redactor};
 use rustwatch_capture::CaptureHandle;
 use rustwatch_core::{
-    DaemonClient, DaemonCommand, DaemonReply, DataPaths, Store,
+    DaemonClient, DaemonCommand, DaemonReply, DataPaths, Note, Store,
     Config,
 };
 use rustwatch_core::ScreenshotScope;
@@ -282,6 +282,105 @@ pub async fn screenshot(paths: &DataPaths, window: bool, screen: bool) -> anyhow
     Ok(())
 }
 
+/// D-10/D-11 annotate: the daemon never prompts (headless under launchd),
+/// so the CLI prompts for the most recent screenshot lacking a note.
+/// Enter saves (redacted), Esc discards.
+pub fn annotate(paths: &DataPaths, config: &Config) -> anyhow::Result<()> {
+    let store = Store::open(&paths.sqlite)?;
+    let Some(shot) = store.latest_screenshot_without_note()? else {
+        println!("No unannotated screenshots — nothing to annotate.");
+        return Ok(());
+    };
+    println!("Screenshot: {} ({})", shot.path.display(), shot.captured_at.format("%H:%M"));
+    println!("Type a note, Enter saves, Esc discards.");
+    match prompt_note()? {
+        Some(text) => {
+            let redactor = Redactor::new(config)?;
+            store.insert_note(&Note {
+                id: uuid::Uuid::new_v4().to_string(),
+                ts: chrono::Utc::now(),
+                note: redactor.scrub(&text),
+                screenshot_id: Some(shot.id),
+            })?;
+            println!("Note saved.");
+        }
+        None => println!("Discarded — no note saved."),
+    }
+    Ok(())
+}
+
+/// Minimal line editor for the annotate prompt: printable chars append,
+/// Backspace deletes, Enter saves, Esc discards. Pure — unit-tested
+/// without a terminal.
+#[derive(Debug, Default)]
+struct NoteEditor {
+    buf: String,
+}
+
+enum NoteOutcome {
+    Pending,
+    Save(String),
+    Discard,
+}
+
+impl NoteEditor {
+    fn key(&mut self, code: crossterm::event::KeyCode) -> NoteOutcome {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Enter => NoteOutcome::Save(std::mem::take(&mut self.buf)),
+            KeyCode::Esc => NoteOutcome::Discard,
+            KeyCode::Backspace => {
+                self.buf.pop();
+                NoteOutcome::Pending
+            }
+            KeyCode::Char(c) => {
+                self.buf.push(c);
+                NoteOutcome::Pending
+            }
+            _ => NoteOutcome::Pending,
+        }
+    }
+}
+
+/// Raw-mode prompt driver: echoes input with basic Backspace support.
+/// Restores the terminal on every exit path.
+fn prompt_note() -> anyhow::Result<Option<String>> {
+    use crossterm::event::{read, Event};
+    use std::io::Write;
+
+    crossterm::terminal::enable_raw_mode()?;
+    let result = (|| -> anyhow::Result<Option<String>> {
+        let mut editor = NoteEditor::default();
+        let mut stdout = std::io::stdout();
+        write!(stdout, "> ")?;
+        stdout.flush()?;
+        loop {
+            let Event::Key(key) = read()? else {
+                continue;
+            };
+            match editor.key(key.code) {
+                NoteOutcome::Pending => {
+                    // Re-render the line: CR, clear, prompt, buffer.
+                    write!(stdout, "\r\x1b[2K> {}", editor.buf)?;
+                    stdout.flush()?;
+                }
+                NoteOutcome::Save(note) => {
+                    write!(stdout, "\r\n")?;
+                    stdout.flush()?;
+                    return Ok(Some(note));
+                }
+                NoteOutcome::Discard => {
+                    write!(stdout, "\r\n")?;
+                    stdout.flush()?;
+                    return Ok(None);
+                }
+            }
+        }
+    })();
+    crossterm::terminal::disable_raw_mode()?;
+    result
+}
+
 pub fn export(
     paths: &DataPaths,
     from: Option<String>,
@@ -415,7 +514,8 @@ fn snippet_for(text: &str) -> String {
 
 #[cfg(test)]
 mod commands_tests {
-    use super::snippet_for;
+    use super::{snippet_for, NoteEditor, NoteOutcome};
+    use crossterm::event::KeyCode;
 
     /// CAPT-05: emoji/CJK floods never panic the snippet path.
     #[test]
@@ -429,5 +529,43 @@ mod commands_tests {
     #[test]
     fn short_cjk_text_passes_through() {
         assert_eq!(snippet_for("日本語テスト"), "日本語テスト");
+    }
+
+    /// D-11: typing + Enter saves the typed text.
+    #[test]
+    fn annotate_enter_saves_typed_text() {
+        let mut editor = NoteEditor::default();
+        for c in "standup notes".chars() {
+            assert!(matches!(editor.key(KeyCode::Char(c)), NoteOutcome::Pending));
+        }
+        match editor.key(KeyCode::Enter) {
+            NoteOutcome::Save(note) => assert_eq!(note, "standup notes"),
+            _ => panic!("Enter must save"),
+        }
+    }
+
+    /// D-11: Esc discards, even with typed text.
+    #[test]
+    fn annotate_esc_discards() {
+        let mut editor = NoteEditor::default();
+        for c in "never mind".chars() {
+            assert!(matches!(editor.key(KeyCode::Char(c)), NoteOutcome::Pending));
+        }
+        assert!(matches!(editor.key(KeyCode::Esc), NoteOutcome::Discard));
+    }
+
+    /// Backspace edits; other keys (arrows, F-keys) are ignored, never saved.
+    #[test]
+    fn annotate_backspace_edits_and_arrows_ignore() {
+        let mut editor = NoteEditor::default();
+        for c in "abc".chars() {
+            editor.key(KeyCode::Char(c));
+        }
+        assert!(matches!(editor.key(KeyCode::Backspace), NoteOutcome::Pending));
+        assert!(matches!(editor.key(KeyCode::Left), NoteOutcome::Pending));
+        match editor.key(KeyCode::Enter) {
+            NoteOutcome::Save(note) => assert_eq!(note, "ab"),
+            _ => panic!("Enter must save"),
+        }
     }
 }

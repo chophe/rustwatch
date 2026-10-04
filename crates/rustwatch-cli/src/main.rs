@@ -31,6 +31,7 @@ enum Commands {
         #[arg(long)]
         screen: bool,
     },
+    Annotate,
     Export {
         #[arg(long)]
         from: Option<String>,
@@ -95,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Screenshot { window, screen } => {
             commands::screenshot(&paths, window, screen).await?
         }
+        Commands::Annotate => commands::annotate(&paths, &config)?,
         Commands::Export { from, to } => commands::export(&paths, from, to)?,
         Commands::Analyze { today: _ } => commands::analyze(&paths, &config).await?,
         Commands::Chart { date, format } => commands::chart(&paths, date, format)?,

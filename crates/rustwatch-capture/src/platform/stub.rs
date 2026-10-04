@@ -38,6 +38,9 @@ impl PlatformCapture {
         _poll_focus_ms: u64,
         _screenshot_on_focus_change: bool,
         _min_interval_secs: u64,
+        _hotkey_enabled: bool,
+        _hotkey_chord: String,
+        _idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _screenshot_root: PathBuf,
     ) -> Result<()> {
         Err(rustwatch_core::Error::UnsupportedPlatform(

@@ -32,6 +32,9 @@ impl CaptureHandle {
         poll_focus_ms: u64,
         screenshot_on_focus_change: bool,
         min_interval_secs: u64,
+        hotkey_enabled: bool,
+        hotkey_chord: String,
+        idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
         screenshot_root: PathBuf,
     ) -> Result<()> {
         self.inner.start(
@@ -39,6 +42,9 @@ impl CaptureHandle {
             poll_focus_ms,
             screenshot_on_focus_change,
             min_interval_secs,
+            hotkey_enabled,
+            hotkey_chord,
+            idle,
             screenshot_root,
         )
     }

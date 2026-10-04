@@ -72,6 +72,11 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     // emits onto the SAME channel as keyboard/focus events (uniform
     // retry/loss accounting — no second code path).
     let scheduler_tx = event_tx.clone();
+    // D-20: shared idle flag — the scheduler's poll sets it, the focus loop
+    // suppresses automatic shots while set, the hotkey ignores it.
+    let idle = Arc::new(AtomicBool::new(false));
+    let scheduler_idle = Arc::clone(&idle);
+    let focus_idle = Arc::clone(&idle);
     let capture = CaptureHandle::new(config.capture.exclude_apps.clone())?;
     let capture_for_ipc = capture.clone();
     let capture_for_watch = capture.clone();
@@ -82,6 +87,9 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         config.capture.poll_focus_ms,
         config.capture.screenshot_on_focus_change,
         config.capture.min_interval_secs,
+        config.capture.hotkey_enabled,
+        config.capture.hotkey_chord.clone(),
+        focus_idle,
         paths.screenshots.clone(),
     )?;
 
@@ -196,6 +204,7 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         Arc::clone(&shutdown_notify),
         config.capture.idle_start_secs,
         config.capture.idle_end_sustained_secs,
+        scheduler_idle,
     ));
 
     let listener = UnixListener::bind(&paths.socket).context("bind daemon socket")?;
@@ -489,6 +498,7 @@ async fn run_screenshot_scheduler(
     shutdown: Arc<tokio::sync::Notify>,
     idle_start_secs: u64,
     idle_end_sustained_secs: u64,
+    idle_flag: Arc<AtomicBool>,
 ) {
     let mut ticker = period.map(|p| {
         let mut t = tokio::time::interval(p);
@@ -520,6 +530,11 @@ async fn run_screenshot_scheduler(
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(last_tick);
                 last_tick = now;
+                // D-20: interval shots pause during idle (the hotkey stays
+                // live). Cadence restarts fresh at idle end via reset().
+                if idle_flag.load(Ordering::SeqCst) {
+                    continue;
+                }
                 // The Notify is lossy: a SIGTERM landing mid-capture misses
                 // the waiter, so the flag (set synchronously by the signal
                 // handler) is the authoritative stop — never shoot post-TERM.
@@ -584,13 +599,25 @@ async fn run_screenshot_scheduler(
                 // A broken probe reads as active: never idle on a broken probe.
                 let idle_secs =
                     PlatformCapture::system_idle_seconds().unwrap_or(0.0) as u64;
-                match poll_idle(
+                // D-20: publish idle for the focus loop, and restart the
+                // interval timer at idle end so cadence resumes fresh
+                // instead of firing a stale shot immediately.
+                let was_idle = idle_state.idle;
+                let signal = poll_idle(
                     &mut idle_state,
                     idle_secs,
                     idle_start_secs,
                     idle_end_sustained_secs,
                     IDLE_POLL_SECS,
-                ) {
+                );
+                idle_flag.store(idle_state.idle, Ordering::SeqCst);
+                if was_idle && !idle_state.idle {
+                    if let Some(t) = ticker.as_mut() {
+                        t.reset();
+                    }
+                    last_tick = Instant::now();
+                }
+                match signal {
                     IdleSignal::None => {}
                     IdleSignal::WentIdle { idle_secs } => {
                         info!(idle_secs, "idle start: closing active segment");

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
-use std::sync::{
+use std::collections::HashSet;
+use std::path::PathBuf;use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
@@ -77,15 +77,33 @@ impl PlatformCapture {
         poll_focus_ms: u64,
         screenshot_on_focus_change: bool,
         min_interval_secs: u64,
+        hotkey_enabled: bool,
+        hotkey_chord: String,
+        idle: Arc<AtomicBool>,
         screenshot_root: PathBuf,
     ) -> Result<()> {
         let exclude = self.exclude_apps.clone();
         let paused_kb = Arc::clone(&self.paused);
         let paused_focus = Arc::clone(&self.paused);
 
+        // Parse once at startup: an unparsable chord disables the hotkey
+        // loudly instead of failing every keypress.
+        let hotkey = if hotkey_enabled {
+            match parse_hotkey(&hotkey_chord) {
+                Some(chord) => Some(chord),
+                None => {
+                    warn!(chord = %hotkey_chord, "ignoring unparsable hotkey_chord; hotkey disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let exclude_kb = exclude.clone();
         let tx_focus = tx.clone();
         let threads = Arc::clone(&self.threads);
+        let kb_root = screenshot_root.clone();
         let keyboard = std::thread::Builder::new()
             .name("capture-keyboard".into())
             .spawn(move || {
@@ -93,7 +111,8 @@ impl PlatformCapture {
                 // the thread instead of finishing it: D-14 keeps the daemon
                 // up degraded, while a real panic still finishes the thread
                 // and trips the daemon's D-06 death watch.
-                if let Err(err) = run_keyboard_loop(tx, paused_kb, exclude_kb) {
+                if let Err(err) = run_keyboard_loop(tx, paused_kb, exclude_kb, hotkey, kb_root)
+                {
                     warn!(?err, "keyboard capture unavailable; thread parked");
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -110,6 +129,7 @@ impl PlatformCapture {
                     poll_focus_ms,
                     screenshot_on_focus_change,
                     min_interval_secs,
+                    idle,
                     screenshot_root,
                     exclude,
                     paused_focus,
@@ -192,24 +212,30 @@ impl KeyEventSource for KeytapSource {
 /// Translate a batch of raw key events into capture events.
 ///
 /// Pure with respect to I/O: `resolve_app` and `read_clipboard` are injected
-/// so tests can drive the full pipeline deterministically.
-fn translate_key_events<A, C>(
+/// so tests can drive the full pipeline deterministically. The hotkey chord
+/// (if configured) is detected here — after the exclusion check, so excluded
+/// apps never fire it (T-02-02) — and `shoot` is injected so tests never
+/// touch the disk.
+fn translate_key_events<A, C, S>(
     raw: &[(bool, keytap::Key)],
     state: &mut KeyState,
     tx: &EventSender<CaptureEvent>,
     exclude_apps: &[String],
     resolve_app: &A,
     read_clipboard: &C,
+    hotkey: Option<&HotkeyChord>,
+    shoot: &S,
 ) where
     A: Fn() -> Option<AppContext>,
     C: Fn() -> Option<String>,
+    S: Fn() -> Option<(PathBuf, ScreenshotScope)>,
 {
     for (is_down, key) in raw {
         if !is_down {
             state.release(*key);
             continue;
         }
-        state.press(*key);
+        let fresh = state.press(*key);
 
         let app = resolve_app().or_else(|| state.last_app.clone());
 
@@ -222,6 +248,22 @@ fn translate_key_events<A, C>(
             }
         }
         state.last_app = app.clone();
+
+        // Hotkey chord: shoot-first, synchronously, on the trigger key-down
+        // — the screenshot never waits for typing. The trigger keypress is
+        // consumed (no phantom space in the timeline). `fresh` suppresses
+        // key-repeat refire while Space is held.
+        if let Some(chord) = hotkey {
+            if chord.matches(state, *key, fresh) {
+                if let Some((path, scope)) = shoot() {
+                    let _ = tx.send(CaptureEvent::new(
+                        CaptureEventKind::Screenshot { path, scope },
+                        app.clone(),
+                    ));
+                }
+                continue;
+            }
+        }
 
         let mods = state.modifiers();
         let key_name = format!("{key:?}");
@@ -268,25 +310,39 @@ pub struct KeyState {
     pub meta_held: bool,
     pub shift_held: bool,
     pub caps_lock: bool,
+    pub ctrl_held: bool,
+    pub alt_held: bool,
+    /// Currently held keys — distinguishes a fresh press from key-repeat
+    /// (keytap reports repeats as key-down) so the hotkey fires once per
+    /// deliberate press, not once per repeat.
+    held: HashSet<keytap::Key>,
     last_app: Option<AppContext>,
 }
 
 impl KeyState {
-    fn press(&mut self, key: keytap::Key) {
+    /// Record a key-down; returns true for a fresh press, false for a
+    /// repeat of an already-held key.
+    fn press(&mut self, key: keytap::Key) -> bool {
         match key {
             keytap::Key::MetaLeft | keytap::Key::MetaRight => self.meta_held = true,
             keytap::Key::ShiftLeft | keytap::Key::ShiftRight => self.shift_held = true,
+            keytap::Key::ControlLeft | keytap::Key::ControlRight => self.ctrl_held = true,
+            keytap::Key::AltLeft | keytap::Key::AltRight => self.alt_held = true,
             keytap::Key::CapsLock => self.caps_lock = !self.caps_lock,
             _ => {}
         }
+        self.held.insert(key)
     }
 
     fn release(&mut self, key: keytap::Key) {
         match key {
             keytap::Key::MetaLeft | keytap::Key::MetaRight => self.meta_held = false,
             keytap::Key::ShiftLeft | keytap::Key::ShiftRight => self.shift_held = false,
+            keytap::Key::ControlLeft | keytap::Key::ControlRight => self.ctrl_held = false,
+            keytap::Key::AltLeft | keytap::Key::AltRight => self.alt_held = false,
             _ => {}
         }
+        self.held.remove(&key);
     }
 
     /// Current modifier state, for both text translation and the `Key` event.
@@ -306,6 +362,12 @@ impl KeyState {
         if self.shift_held {
             names.push("Shift".to_string());
         }
+        if self.ctrl_held {
+            names.push("Ctrl".to_string());
+        }
+        if self.alt_held {
+            names.push("Alt".to_string());
+        }
         if self.caps_lock {
             names.push("CapsLock".to_string());
         }
@@ -313,14 +375,115 @@ impl KeyState {
     }
 }
 
+/// Chord-on-tap hotkey (default Ctrl+Shift+Space): zero new deps or
+/// permissions, sub-ms detection on the existing keytap stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyChord {
+    ctrl: bool,
+    shift: bool,
+    meta: bool,
+    alt: bool,
+    key: keytap::Key,
+}
+
+impl HotkeyChord {
+    /// Fire only on the fresh press of the chord's main key with EXACTLY the
+    /// configured modifiers held — partial presses and modifier-only
+    /// sequences never fire, and extra modifiers don't count.
+    fn matches(&self, state: &KeyState, key: keytap::Key, fresh: bool) -> bool {
+        fresh
+            && key == self.key
+            && state.ctrl_held == self.ctrl
+            && state.shift_held == self.shift
+            && state.meta_held == self.meta
+            && state.alt_held == self.alt
+    }
+}
+
+/// Tiny case-insensitive chord parser: `ctrl/shift/meta/alt` (plus common
+/// aliases) and exactly one main key (space, enter, tab, esc, a–z, 0–9).
+/// Returns None for anything else — including a bare key with no modifiers,
+/// which is a keypress, not a chord.
+fn parse_hotkey(raw: &str) -> Option<HotkeyChord> {
+    let (mut ctrl, mut shift, mut meta, mut alt) = (false, false, false, false);
+    let mut main: Option<keytap::Key> = None;
+    for token in raw.split('+') {
+        match token.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "shift" => shift = true,
+            "meta" | "cmd" | "command" | "super" => meta = true,
+            "alt" | "opt" | "option" => alt = true,
+            "space" => main = Some(keytap::Key::Space),
+            "enter" | "return" => main = Some(keytap::Key::Enter),
+            "tab" => main = Some(keytap::Key::Tab),
+            "esc" | "escape" => main = Some(keytap::Key::Escape),
+            s if s.len() == 1 => main = key_from_char(s.chars().next()?),
+            _ => return None,
+        }
+    }
+    let key = main?;
+    if !(ctrl || shift || meta || alt) {
+        return None;
+    }
+    Some(HotkeyChord { ctrl, shift, meta, alt, key })
+}
+
+fn key_from_char(c: char) -> Option<keytap::Key> {
+    use keytap::Key;
+    Some(match c {
+        'a' => Key::A,
+        'b' => Key::B,
+        'c' => Key::C,
+        'd' => Key::D,
+        'e' => Key::E,
+        'f' => Key::F,
+        'g' => Key::G,
+        'h' => Key::H,
+        'i' => Key::I,
+        'j' => Key::J,
+        'k' => Key::K,
+        'l' => Key::L,
+        'm' => Key::M,
+        'n' => Key::N,
+        'o' => Key::O,
+        'p' => Key::P,
+        'q' => Key::Q,
+        'r' => Key::R,
+        's' => Key::S,
+        't' => Key::T,
+        'u' => Key::U,
+        'v' => Key::V,
+        'w' => Key::W,
+        'x' => Key::X,
+        'y' => Key::Y,
+        'z' => Key::Z,
+        '0' => Key::Digit0,
+        '1' => Key::Digit1,
+        '2' => Key::Digit2,
+        '3' => Key::Digit3,
+        '4' => Key::Digit4,
+        '5' => Key::Digit5,
+        '6' => Key::Digit6,
+        '7' => Key::Digit7,
+        '8' => Key::Digit8,
+        '9' => Key::Digit9,
+        _ => return None,
+    })
+}
+
 fn run_keyboard_loop(
     tx: EventSender<CaptureEvent>,
     paused: Arc<AtomicBool>,
     exclude_apps: Vec<String>,
+    hotkey: Option<HotkeyChord>,
+    screenshot_root: PathBuf,
 ) -> anyhow::Result<()> {
     let tap = keytap::Tap::new().map_err(|e| anyhow::anyhow!("keytap init failed: {e}"))?;
     let mut source = KeytapSource { tap };
     let mut state = KeyState::default();
+    // Shoot-first capture for the hotkey chord: synchronous Window shot
+    // (Scope honesty from 2b labels the Screen fallback correctly).
+    let shoot_root = screenshot_root.clone();
 
     loop {
         if paused.load(Ordering::Relaxed) {
@@ -338,6 +501,8 @@ fn run_keyboard_loop(
             &exclude_apps,
             &current_app_context,
             &|| read_clipboard_text().ok(),
+            hotkey.as_ref(),
+            &|| capture_to_disk(ScreenshotScope::Window, shoot_root.clone()).ok(),
         );
     }
     Ok(())
@@ -348,6 +513,7 @@ fn run_focus_loop(
     poll_focus_ms: u64,
     screenshot_on_focus_change: bool,
     min_interval_secs: u64,
+    idle: Arc<AtomicBool>,
     screenshot_root: PathBuf,
     exclude_apps: Vec<String>,
     paused: Arc<AtomicBool>,
@@ -379,10 +545,10 @@ fn run_focus_loop(
             );
             let _ = tx.send(change);
 
-            if screenshot_on_focus_change {
-                // D-09: 2 s cooldown + at most 3 shots per rolling 10 s, so
-                // Alt-Tab spam can never fill the disk (T-02-03). History is
-                // pruned to the burst window to stay bounded.
+            // D-09 throttle (2 s cooldown + 3-per-10 s burst, T-02-03) and
+            // D-20 idle suppression (hotkey stays live): the FocusChange
+            // event above still flows, and `last` still advances below.
+            if screenshot_on_focus_change && !idle.load(Ordering::Relaxed) {
                 let now = Instant::now();
                 shots.retain(|t| now.saturating_duration_since(*t) <= FOCUS_BURST_WINDOW);
                 if should_shoot(now, &shots, min_interval) {
@@ -633,6 +799,17 @@ mod tests {
     /// Drive the real translation pipeline with a scripted key sequence.
     /// No tap, no Accessibility grant, no physical keyboard.
     fn run(raw: &[(bool, Key)], exclude: &[&str], app_name: &str) -> Vec<CaptureEvent> {
+        run_with_hotkey(raw, exclude, app_name, None)
+    }
+
+    /// Same pipeline with a hotkey chord armed; the injected shoot never
+    /// touches the disk — it hands back a fake path.
+    fn run_with_hotkey(
+        raw: &[(bool, Key)],
+        exclude: &[&str],
+        app_name: &str,
+        hotkey: Option<&super::HotkeyChord>,
+    ) -> Vec<CaptureEvent> {
         let (tx, rx) = std::sync::mpsc::channel::<CaptureEvent>();
         let mut state = KeyState::default();
         let exclude: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
@@ -645,6 +822,13 @@ mod tests {
             &exclude,
             &|| Some(ctx.clone()),
             &|| None,
+            hotkey,
+            &|| {
+                Some((
+                    std::path::PathBuf::from("/tmp/fake-hotkey.png"),
+                    rustwatch_core::ScreenshotScope::Window,
+                ))
+            },
         );
 
         let mut out = Vec::new();
@@ -864,6 +1048,8 @@ mod tests {
             &[],
             &|| Some(ctx.clone()),
             &|| Some("pasted content".to_string()),
+            None,
+            &|| None,
         );
 
         let mut out = Vec::new();
@@ -960,14 +1146,193 @@ mod tests {
         ));
     }
 
-    /// The Quartz idle probe links and returns a sane value. (Prints the
-    /// live reading with --nocapture: the ground truth for whether the
-    /// test box is HID-active.)
+    /// The Quartz idle probe links and returns a sane value.
     #[test]
     fn idle_probe_links_and_returns_finite() {
         let secs = super::PlatformCapture::system_idle_seconds()
             .expect("CGEventSourceSecondsSinceLastEventType must answer");
-        eprintln!("live idle reading: {secs:.1}s since last HID input");
         assert!(secs.is_finite() && secs >= 0.0);
+    }
+
+    /// The default chord parses: ctrl+shift+space, case-insensitive.
+    #[test]
+    fn default_chord_parses() {
+        let chord = super::parse_hotkey("ctrl+shift+space").expect("default chord");
+        assert_eq!(
+            chord,
+            super::HotkeyChord {
+                ctrl: true,
+                shift: true,
+                meta: false,
+                alt: false,
+                key: Key::Space,
+            }
+        );
+        assert!(super::parse_hotkey("Ctrl+Shift+Space").is_some());
+        assert!(super::parse_hotkey("control+shift+space").is_some());
+    }
+
+    #[test]
+    fn chord_parser_rejects_non_chords() {
+        // Bare keys are keypresses, not chords.
+        assert!(super::parse_hotkey("space").is_none());
+        assert!(super::parse_hotkey("a").is_none());
+        // Unknown tokens fail loudly (hotkey disables with a warning).
+        assert!(super::parse_hotkey("ctrl+shift+f13x").is_none());
+        assert!(super::parse_hotkey("").is_none());
+        // Letters and digits work as main keys.
+        assert!(super::parse_hotkey("ctrl+m").is_some());
+        assert!(super::parse_hotkey("meta+shift+1").is_some());
+    }
+
+    fn chord() -> super::HotkeyChord {
+        super::parse_hotkey("ctrl+shift+space").unwrap()
+    }
+
+    fn screenshots_of(events: &[CaptureEvent]) -> Vec<&CaptureEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, CaptureEventKind::Screenshot { .. }))
+            .collect()
+    }
+
+    /// The full combination fires exactly one screenshot — and the trigger
+    /// Space leaves no phantom text behind.
+    #[test]
+    fn full_chord_fires_one_screenshot() {
+        let events = run_with_hotkey(
+            &[
+                down(Key::ControlLeft),
+                down(Key::ShiftLeft),
+                down(Key::Space),
+            ],
+            &[],
+            "Safari",
+            Some(&chord()),
+        );
+        let shots = screenshots_of(&events);
+        assert_eq!(shots.len(), 1);
+        assert_eq!(text_of(&events), "");
+        // The shot carries the app context for segment linkage.
+        assert_eq!(
+            shots[0].app.as_ref().map(|a| a.app_name.as_str()),
+            Some("Safari")
+        );
+    }
+
+    /// Partial presses and modifier-only sequences never fire.
+    #[test]
+    fn partial_chord_does_not_fire() {
+        let chord = chord();
+        // Missing shift.
+        let events = run_with_hotkey(
+            &[down(Key::ControlLeft), down(Key::Space)],
+            &[],
+            "Safari",
+            Some(&chord),
+        );
+        assert!(screenshots_of(&events).is_empty());
+        // Modifiers only, no Space.
+        let events = run_with_hotkey(
+            &[down(Key::ControlLeft), down(Key::ShiftLeft)],
+            &[],
+            "Safari",
+            Some(&chord),
+        );
+        assert!(screenshots_of(&events).is_empty());
+        // Space alone.
+        let events = run_with_hotkey(&[down(Key::Space)], &[], "Safari", Some(&chord));
+        assert!(screenshots_of(&events).is_empty());
+        assert_eq!(text_of(&events), " ");
+        // Extra modifiers don't count.
+        let events = run_with_hotkey(
+            &[
+                down(Key::ControlLeft),
+                down(Key::ShiftLeft),
+                down(Key::AltLeft),
+                down(Key::Space),
+            ],
+            &[],
+            "Safari",
+            Some(&chord),
+        );
+        assert!(screenshots_of(&events).is_empty());
+    }
+
+    /// Holding Space doesn't repeat-fire; releasing and pressing again does.
+    #[test]
+    fn chord_repeat_is_suppressed_until_release() {
+        let chord = chord();
+        let (tx, rx) = std::sync::mpsc::channel::<CaptureEvent>();
+        let mut state = KeyState::default();
+        let ctx = app("Safari");
+        let shoot = || {
+            Some((
+                std::path::PathBuf::from("/tmp/fake.png"),
+                rustwatch_core::ScreenshotScope::Window,
+            ))
+        };
+        let drive = |raw: &[(bool, Key)], state: &mut KeyState| {
+            super::translate_key_events(
+                raw,
+                state,
+                &tx,
+                &[],
+                &|| Some(ctx.clone()),
+                &|| None,
+                Some(&chord),
+                &shoot,
+            );
+        };
+        drive(
+            &[down(Key::ControlLeft), down(Key::ShiftLeft), down(Key::Space)],
+            &mut state,
+        );
+        // Key-repeat while held: no second shot.
+        drive(&[down(Key::Space), down(Key::Space)], &mut state);
+        // Release + fresh press: fires again.
+        drive(&[(false, Key::Space), down(Key::Space)], &mut state);
+        let shots: Vec<_> = {
+            let mut out = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev.kind, CaptureEventKind::Screenshot { .. }) {
+                    out.push(ev);
+                }
+            }
+            out
+        };
+        assert_eq!(shots.len(), 2);
+    }
+
+    /// T-02-02: excluded apps emit nothing — not even on the chord keys.
+    #[test]
+    fn chord_in_excluded_app_emits_nothing() {
+        let events = run_with_hotkey(
+            &[
+                down(Key::ControlLeft),
+                down(Key::ShiftLeft),
+                down(Key::Space),
+            ],
+            &["1Password"],
+            "1Password",
+            Some(&chord()),
+        );
+        assert!(events.is_empty());
+    }
+
+    /// Hotkey disabled (or unparsable): the chord keys behave like normal keys.
+    #[test]
+    fn no_hotkey_means_normal_keys() {
+        let events = run_with_hotkey(
+            &[
+                down(Key::ControlLeft),
+                down(Key::ShiftLeft),
+                down(Key::Space),
+            ],
+            &[],
+            "Safari",
+            None,
+        );
+        assert!(screenshots_of(&events).is_empty());
     }
 }

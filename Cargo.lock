@@ -4418,6 +4418,7 @@ dependencies = [
  "tracing",
  "tracing-indicatif",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
