@@ -12,7 +12,7 @@ use rustwatch_core::{
     SegmentGrouper, Store,
 };
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -33,10 +33,13 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&paths.socket);
     }
 
-    let store = Arc::new(Mutex::new(Store::open(&paths.sqlite)?));
+    let store = Store::open(&paths.sqlite)?;
     let paused = Arc::new(AtomicBool::new(false));
     let events_captured = Arc::new(AtomicU64::new(0));
     let segments_written = Arc::new(AtomicU64::new(0));
+    let write_errors = Arc::new(AtomicU64::new(0));
+    let dropped_events = Arc::new(AtomicU64::new(0));
+    let queued = Arc::new(AtomicU64::new(0));
     let started_at = Utc::now().to_rfc3339();
 
     std::fs::write(&paths.pid_file, std::process::id().to_string())?;
@@ -52,33 +55,53 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         paths.screenshots.clone(),
     )?;
 
-    let writer_store = Arc::clone(&store);
     let writer_segments = Arc::clone(&segments_written);
     let writer_events = Arc::clone(&events_captured);
+    let writer_errors = Arc::clone(&write_errors);
+    // D-02: the writer awaits the lock / owns the store — it never drops an
+    // event on IPC contention. Every persistence call is counted: failures
+    // surface via `error!` AND the `write_errors` counter (D-01), never `let _ =`.
     tokio::spawn(async move {
         let mut grouper = SegmentGrouper::new();
         while let Some(event) = event_rx.recv().await {
             writer_events.fetch_add(1, Ordering::Relaxed);
-            if let Ok(store) = writer_store.try_lock() {
-                let _ = store.insert_event(&event);
-                if let Some(segment) = grouper.on_event(&event) {
-                    let _ = store.insert_segment(&segment);
-                    writer_segments.fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = store.insert_event(&event) {
+                error!(?err, "writer: insert_event failed");
+                writer_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(segment) = grouper.on_event(&event) {
+                match store.insert_segment(&segment) {
+                    Ok(()) => {
+                        writer_segments.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        error!(?err, "writer: insert_segment failed");
+                        writer_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                if let CaptureEventKind::Screenshot { path, scope } = &event.kind {
-                    let _ = store.insert_screenshot(&rustwatch_core::ScreenshotRecord {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        path: path.clone(),
-                        scope: *scope,
-                        captured_at: event.timestamp,
-                        segment_id: None,
-                    });
+            }
+            if let CaptureEventKind::Screenshot { path, scope } = &event.kind {
+                if let Err(err) = store.insert_screenshot(&rustwatch_core::ScreenshotRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    path: path.clone(),
+                    scope: *scope,
+                    captured_at: event.timestamp,
+                    segment_id: None,
+                }) {
+                    error!(?err, "writer: insert_screenshot failed");
+                    writer_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         if let Some(segment) = grouper.flush() {
-            if let Ok(store) = writer_store.try_lock() {
-                let _ = store.insert_segment(&segment);
+            match store.insert_segment(&segment) {
+                Ok(()) => {
+                    writer_segments.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    error!(?err, "writer: flush insert_segment failed");
+                    writer_errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     });
@@ -89,12 +112,15 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let paused_flag = Arc::clone(&paused);
-        let store_ref = Arc::clone(&store);
         let events_ref = Arc::clone(&events_captured);
         let segments_ref = Arc::clone(&segments_written);
+        let errors_ref = Arc::clone(&write_errors);
+        let dropped_ref = Arc::clone(&dropped_events);
+        let queued_ref = Arc::clone(&queued);
         let started = started_at.clone();
         let capture_ref = paths.screenshots.clone();
         let capture_handle = capture_for_ipc.clone();
+        let sqlite_path = paths.sqlite.clone();
 
         let capture_shots = capture_ref.clone();
 
@@ -112,27 +138,44 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                         capture_handle.set_paused(false);
                         DaemonReply::Ok
                     }
-                    DaemonCommand::Status => DaemonReply::Status {
-                        state: DaemonState {
-                            running: true,
-                            paused: paused_flag.load(Ordering::Relaxed),
-                            pid: Some(std::process::id()),
-                            events_captured: events_ref.load(Ordering::Relaxed),
-                            segments_written: segments_ref.load(Ordering::Relaxed),
-                            started_at: Some(started.clone()),
-                        },
-                    },
+                    DaemonCommand::Status => {
+                        let write_errors = errors_ref.load(Ordering::Relaxed);
+                        let dropped_events = dropped_ref.load(Ordering::Relaxed);
+                        let queued = queued_ref.load(Ordering::Relaxed);
+                        DaemonReply::Status {
+                            state: DaemonState {
+                                running: true,
+                                paused: paused_flag.load(Ordering::Relaxed),
+                                pid: Some(std::process::id()),
+                                events_captured: events_ref.load(Ordering::Relaxed),
+                                segments_written: segments_ref.load(Ordering::Relaxed),
+                                started_at: Some(started.clone()),
+                                write_errors,
+                                dropped_events,
+                                queued,
+                                capture_health: DaemonState::health_label(
+                                    write_errors,
+                                    dropped_events,
+                                    queued,
+                                ),
+                            },
+                        }
+                    }
                     DaemonCommand::Tail { limit } => {
-                        if let Ok(store) = store_ref.try_lock() {
-                            match store.list_events_since(None, limit) {
-                                Ok(events) => DaemonReply::Events { events },
-                                Err(err) => DaemonReply::Error {
+                        // Tail reads through a short-lived separate connection so a
+                        // long scan can never stall the writer (Pattern 1). The
+                        // limit is clamped server-side (Pitfall 7) so a huge tail
+                        // cannot blow past the IPC frame cap.
+                        let limit = limit.min(rustwatch_core::ipc::TAIL_MAX_LIMIT);
+                        match Store::open(&sqlite_path)
+                            .and_then(|store| store.list_events_since(None, limit))
+                        {
+                            Ok(events) => DaemonReply::Events { events },
+                            Err(err) => {
+                                error!(?err, "tail read failed");
+                                DaemonReply::Error {
                                     message: err.to_string(),
-                                },
-                            }
-                        } else {
-                            DaemonReply::Error {
-                                message: "store locked".into(),
+                                }
                             }
                         }
                     }

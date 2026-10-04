@@ -98,6 +98,23 @@ pub async fn status(paths: &DataPaths, config: &Config) -> anyhow::Result<()> {
                 "Daemon: running={} paused={} captured={} segments={}",
                 state.running, state.paused, state.events_captured, state.segments_written
             );
+            // D-07 health banner: quiet when healthy, loud with nonzero
+            // detail counters when degraded.
+            let banner = state.health_banner();
+            if state.capture_health == "healthy" {
+                println!("{}", banner.green());
+            } else {
+                println!("{}", banner.yellow());
+                if state.write_errors > 0 {
+                    println!("  write errors: {}", state.write_errors);
+                }
+                if state.dropped_events > 0 {
+                    println!("  dropped events: {}", state.dropped_events);
+                }
+                if state.queued > 0 {
+                    println!("  queued for retry: {}", state.queued);
+                }
+            }
         }
     } else {
         println!("{}", "Daemon: not running".yellow());
