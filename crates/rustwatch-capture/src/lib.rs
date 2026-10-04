@@ -31,17 +31,23 @@ impl CaptureHandle {
         tx: std::sync::mpsc::Sender<CaptureEvent>,
         poll_focus_ms: u64,
         screenshot_on_focus_change: bool,
+        min_interval_secs: u64,
         screenshot_root: PathBuf,
     ) -> Result<()> {
         self.inner.start(
             tx,
             poll_focus_ms,
             screenshot_on_focus_change,
+            min_interval_secs,
             screenshot_root,
         )
     }
 
-    pub fn capture_screenshot(&self, scope: ScreenshotScope, root: PathBuf) -> Result<PathBuf> {
+    pub fn capture_screenshot(
+        &self,
+        scope: ScreenshotScope,
+        root: PathBuf,
+    ) -> Result<(PathBuf, ScreenshotScope)> {
         self.inner.capture_screenshot(scope, root)
     }
 

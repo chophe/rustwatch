@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::{
-    ActivityRecord, CaptureEvent, Result, ScreenshotRecord, SessionSegment,
+    ActivityRecord, CaptureEvent, Note, Result, ScreenshotRecord, SessionSegment,
 };
 
 embed_migrations!("migrations");
@@ -139,8 +139,8 @@ impl Store {
 
     pub fn insert_segment(&self, segment: &SessionSegment) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO segments (id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO segments (id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count, idle)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 segment.id,
                 segment.app_name,
@@ -151,6 +151,7 @@ impl Store {
                 segment.started_at.to_rfc3339(),
                 segment.ended_at.to_rfc3339(),
                 segment.event_count,
+                segment.idle as i64,
             ],
         )?;
         Ok(())
@@ -190,6 +191,51 @@ impl Store {
         Ok(())
     }
 
+    /// D-10: persist an annotation note (text already redacted by the
+    /// caller) linked to the screenshot it annotates.
+    pub fn insert_note(&self, note: &Note) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO notes (id, ts, note, screenshot_id) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                note.id,
+                note.ts.to_rfc3339(),
+                note.note,
+                note.screenshot_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// D-11: the annotate prompt targets the most recent screenshot that has
+    /// no note yet — one prompt, one shot, no backlog of unannotated rows.
+    pub fn latest_screenshot_without_note(&self) -> Result<Option<ScreenshotRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, scope, captured_at, segment_id FROM screenshots s
+             WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.screenshot_id = s.id)
+             ORDER BY captured_at DESC LIMIT 1",
+        )?;
+        stmt.query_row([], map_screenshot_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Digest use (Phase 5): all notes logged on a calendar date.
+    pub fn list_notes_for_date(&self, date: chrono::NaiveDate) -> Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, note, screenshot_id FROM notes
+             WHERE date(ts) = date(?1) ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(params![date.format("%Y-%m-%d").to_string()], |row| {
+            Ok(Note {
+                id: row.get(0)?,
+                ts: parse_ts(row.get(1)?)?,
+                note: row.get(2)?,
+                screenshot_id: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn list_events_since(
         &self,
         since: Option<DateTime<Utc>>,
@@ -227,7 +273,7 @@ impl Store {
         to: DateTime<Utc>,
     ) -> Result<Vec<SessionSegment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count
+            "SELECT id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count, idle
              FROM segments WHERE started_at >= ?1 AND ended_at <= ?2 ORDER BY started_at ASC",
         )?;
         let rows = stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339()], |row| {
@@ -241,6 +287,7 @@ impl Store {
                 started_at: parse_ts(row.get(6)?)?,
                 ended_at: parse_ts(row.get(7)?)?,
                 event_count: row.get(8)?,
+                idle: row.get::<_, i64>(9)? != 0,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
@@ -248,7 +295,7 @@ impl Store {
 
     pub fn list_unanalyzed_segments(&self, limit: usize) -> Result<Vec<SessionSegment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.app_name, s.window_title, s.process_id, s.bundle_id, s.text_buffer, s.started_at, s.ended_at, s.event_count
+            "SELECT s.id, s.app_name, s.window_title, s.process_id, s.bundle_id, s.text_buffer, s.started_at, s.ended_at, s.event_count, s.idle
              FROM segments s
              LEFT JOIN activities a ON a.segment_ids_json LIKE '%' || s.id || '%'
              WHERE a.id IS NULL
@@ -266,6 +313,7 @@ impl Store {
                 started_at: parse_ts(row.get(6)?)?,
                 ended_at: parse_ts(row.get(7)?)?,
                 event_count: row.get(8)?,
+                idle: row.get::<_, i64>(9)? != 0,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
@@ -296,7 +344,7 @@ impl Store {
 
     pub fn get_segment(&self, id: &str) -> Result<Option<SessionSegment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count
+            "SELECT id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count, idle
              FROM segments WHERE id = ?1",
         )?;
         stmt.query_row(params![id], |row| {
@@ -310,6 +358,7 @@ impl Store {
                 started_at: parse_ts(row.get(6)?)?,
                 ended_at: parse_ts(row.get(7)?)?,
                 event_count: row.get(8)?,
+                idle: row.get::<_, i64>(9)? != 0,
             })
         })
         .optional()
@@ -347,6 +396,24 @@ fn parse_ts(raw: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&raw)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// First reader of the screenshots table: scope was write-only until the
+/// annotate flow needed it. Unknown values fall back to Screen — the honest
+/// fullscreen reading — rather than failing the prompt.
+fn map_screenshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScreenshotRecord> {
+    let scope_raw: String = row.get(2)?;
+    let scope = match scope_raw.as_str() {
+        "window" => crate::ScreenshotScope::Window,
+        _ => crate::ScreenshotScope::Screen,
+    };
+    Ok(ScreenshotRecord {
+        id: row.get(0)?,
+        path: std::path::PathBuf::from(row.get::<_, String>(1)?),
+        scope,
+        captured_at: parse_ts(row.get(3)?)?,
+        segment_id: row.get(4)?,
+    })
 }
 
 fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureEvent> {
@@ -456,8 +523,7 @@ mod retry_queue_tests {
     /// Corrupt timestamps error instead of becoming `now()`: the time
     /// series must never be silently rewritten.
     #[test]
-    fn corrupt_timestamp_errors_instead_of_now() {
-        let dir = std::env::temp_dir().join(format!(
+    fn corrupt_timestamp_errors_instead_of_now() {        let dir = std::env::temp_dir().join(format!(
             "rustwatch-corrupt-ts-{}",
             std::process::id()
         ));
@@ -471,5 +537,133 @@ mod retry_queue_tests {
             )
             .unwrap();
         assert!(store.list_events_since(None, 10).is_err());
+    }
+}
+
+#[cfg(test)]
+mod notes_idle_tests {
+    use super::*;
+    use crate::events::CaptureEventKind;
+
+    fn test_store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "rustwatch-notes-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Store::open(&dir.join("test.db")).unwrap()
+    }
+
+    /// V2 applies on a fresh database: the notes table exists and segments
+    /// carry the idle column defaulting to 0.
+    #[test]
+    fn v2_migration_applies_clean() {
+        let store = test_store("v2");
+        let notes: String = store
+            .connection()
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='notes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes, "notes");
+        let idle_default: i64 = store
+            .connection()
+            .query_row("SELECT dflt_value FROM pragma_table_info('segments') WHERE name='idle'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|v| v.parse().unwrap())
+            .unwrap();
+        assert_eq!(idle_default, 0);
+    }
+
+    /// Idle segments round-trip their flag; work segments stay false.
+    #[test]
+    fn idle_flag_round_trips() {
+        let store = test_store("idle");
+        let mut grouper = crate::SegmentGrouper::new();
+        let now = chrono::Utc::now();
+        grouper.on_event(&CaptureEvent::new(
+            CaptureEventKind::TextDelta { text: "work".into() },
+            None,
+        ));
+        let idle_seg = grouper.mark_idle(now).unwrap();
+        store.insert_segment(&idle_seg).unwrap();
+        let from = now - chrono::Duration::hours(1);
+        let to = now + chrono::Duration::hours(1);
+        let segs = store.list_segments_between(from, to).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].idle);
+        assert_eq!(store.get_segment(&segs[0].id).unwrap().unwrap().idle, true);
+    }
+
+    /// D-10/D-11: annotate targets the newest unnoted screenshot; a noted
+    /// screenshot is never offered again; notes list by date.
+    #[test]
+    fn annotate_targets_newest_screenshot_without_note() {
+        let store = test_store("annotate");
+        let now = chrono::Utc::now();
+        for (id, secs) in [("old", 300), ("new", 60)] {
+            store
+                .insert_screenshot(&ScreenshotRecord {
+                    id: id.to_string(),
+                    path: std::path::PathBuf::from(format!("/tmp/{id}.png")),
+                    scope: crate::ScreenshotScope::Screen,
+                    captured_at: now - chrono::Duration::seconds(secs),
+                    segment_id: None,
+                })
+                .unwrap();
+        }
+        let target = store.latest_screenshot_without_note().unwrap().unwrap();
+        assert_eq!(target.id, "new");
+        store
+            .insert_note(&Note {
+                id: "n1".into(),
+                ts: now,
+                note: "annotated".into(),
+                screenshot_id: Some("new".into()),
+            })
+            .unwrap();
+        let target = store.latest_screenshot_without_note().unwrap().unwrap();
+        assert_eq!(target.id, "old");
+        let notes = store.list_notes_for_date(now.date_naive()).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].screenshot_id.as_deref(), Some("new"));
+    }
+
+    /// Everything noted: the prompt reports nothing to annotate.
+    #[test]
+    fn no_unnoted_screenshots_returns_none() {
+        let store = test_store("empty");
+        assert!(store.latest_screenshot_without_note().unwrap().is_none());
+    }
+
+    /// A database written by 01-01 (bare V1 schema, no history row) gains
+    /// the idle column with old rows reading back non-idle.
+    #[test]
+    fn v2_upgrades_an_existing_v1_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustwatch-v1-upgrade-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/V1__initial.sql"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO segments (id, app_name, window_title, process_id, bundle_id, text_buffer, started_at, ended_at, event_count)
+             VALUES ('old', 'Safari', 't', 1, NULL, 'work', '2026-01-01T00:00:00+00:00', '2026-01-01T01:00:00+00:00', 5)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        let old = store.get_segment("old").unwrap().unwrap();
+        assert!(!old.idle);
+        assert_eq!(old.event_count, 5);
     }
 }

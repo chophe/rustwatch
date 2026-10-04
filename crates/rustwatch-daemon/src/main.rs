@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
-use rustwatch_capture::CaptureHandle;
+use rustwatch_capture::{CaptureHandle, PlatformCapture};
 use rustwatch_core::{
     is_retryable_store_error,
     paths::{ensure_parent, load_or_create_config},
@@ -81,6 +81,7 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         event_tx,
         config.capture.poll_focus_ms,
         config.capture.screenshot_on_focus_change,
+        config.capture.min_interval_secs,
         paths.screenshots.clone(),
     )?;
 
@@ -182,19 +183,20 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         })
         .context("spawn writer thread")?;
 
-    // CAPT-02: interval screenshots ride the same mpsc channel as capture
-    // events. A 0 interval disables interval shots entirely.
-    let scheduler_handle = interval_duration(config.capture.screenshot_interval_secs).map(|period| {
-        tokio::spawn(run_screenshot_scheduler(
-            capture.clone(),
-            scheduler_tx,
-            period,
-            paths.screenshots.clone(),
-            Arc::clone(&paused),
-            Arc::clone(&shutdown),
-            Arc::clone(&shutdown_notify),
-        ))
-    });
+    // CAPT-02/D-17: the scheduler owns the interval tick AND the ~5 s
+    // idle poll. It always runs — a 0 interval disables interval shots but
+    // idle detection must keep working.
+    let scheduler_handle = tokio::spawn(run_screenshot_scheduler(
+        capture.clone(),
+        scheduler_tx,
+        interval_duration(config.capture.screenshot_interval_secs),
+        paths.screenshots.clone(),
+        Arc::clone(&paused),
+        Arc::clone(&shutdown),
+        Arc::clone(&shutdown_notify),
+        config.capture.idle_start_secs,
+        config.capture.idle_end_sustained_secs,
+    ));
 
     let listener = UnixListener::bind(&paths.socket).context("bind daemon socket")?;
     // T-01-03: the socket streams full keystroke/screen history — owner-only
@@ -228,11 +230,9 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                 }
                 // D-06 covers the scheduler too: a dead interval task must
                 // restart the daemon, never silently stop screenshots.
-                if let Some(handle) = &scheduler_handle {
-                    if handle.is_finished() && !shutdown.load(Ordering::SeqCst) {
-                        error!("scheduler task died unexpectedly; exiting for restart");
-                        std::process::exit(1);
-                    }
+                if scheduler_handle.is_finished() && !shutdown.load(Ordering::SeqCst) {
+                    error!("scheduler task died unexpectedly; exiting for restart");
+                    std::process::exit(1);
                 }
             }
             res = listener.accept() => {
@@ -314,9 +314,16 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                         match CaptureHandle::new(Vec::new())
                             .and_then(|h| h.capture_screenshot(scope, capture_shots.clone()))
                         {
-                            Ok(path) => DaemonReply::Screenshot {
-                                path: path.display().to_string(),
-                            },
+                            Ok((path, actual)) => {
+                                if actual != scope {
+                                    // T-02-01: the row/file truth is the
+                                    // actual scope (e.g. Screen fallback).
+                                    tracing::debug!(requested = ?scope, actual = ?actual, "screenshot scope fell back");
+                                }
+                                DaemonReply::Screenshot {
+                                    path: path.display().to_string(),
+                                }
+                            }
                             Err(err) => DaemonReply::Error {
                                 message: err.to_string(),
                             },
@@ -343,9 +350,7 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     // The scheduler broke out of its select! on the shutdown notification;
     // await it so an in-flight interval shot finishes before the runtime
     // drops (a detached send failure is harmless — the writer is gone).
-    if let Some(handle) = scheduler_handle {
-        let _ = handle.await;
-    }
+    let _ = scheduler_handle.await;
     Ok(())
 }
 
@@ -413,6 +418,56 @@ fn detect_wake(elapsed: Duration, interval: Duration) -> bool {
     elapsed > interval + WAKE_SLACK
 }
 
+/// D-17: hardware-idle poll cadence. Cheap Quartz getter, no reason to be rarer.
+const IDLE_POLL_SECS: u64 = 5;
+
+/// D-19 hysteresis state, owned by the scheduler task (the capture layer
+/// owns the clock per Pattern 2; the fold stays pure).
+#[derive(Debug, Default)]
+struct IdleState {
+    idle: bool,
+    /// Consecutive active polls while idle, in seconds.
+    active_streak_secs: u64,
+}
+
+enum IdleSignal {
+    None,
+    WentIdle { idle_secs: u64 },
+    BecameActive,
+}
+
+/// D-17/D-19 transition logic over injected values — no clock, no I/O.
+/// Idle starts after `start_after_secs` of no input; it ends only after
+/// `end_after_secs` of SUSTAINED activity, so a stray nudge (one active
+/// poll, then quiet) resets the streak instead of ending idle.
+fn poll_idle(
+    state: &mut IdleState,
+    idle_secs: u64,
+    start_after_secs: u64,
+    end_after_secs: u64,
+    poll_secs: u64,
+) -> IdleSignal {
+    if !state.idle {
+        state.active_streak_secs = 0;
+        if idle_secs >= start_after_secs {
+            state.idle = true;
+            return IdleSignal::WentIdle { idle_secs };
+        }
+        return IdleSignal::None;
+    }
+    if idle_secs <= poll_secs {
+        state.active_streak_secs += poll_secs;
+        if state.active_streak_secs >= end_after_secs {
+            state.idle = false;
+            state.active_streak_secs = 0;
+            return IdleSignal::BecameActive;
+        }
+        return IdleSignal::None;
+    }
+    state.active_streak_secs = 0;
+    IdleSignal::None
+}
+
 /// CAPT-02/D-12: one `tokio::time::interval` ticking at `period`.
 ///
 /// Every tick shoots EXACTLY once via `spawn_blocking` (xcap is blocking)
@@ -421,20 +476,32 @@ fn detect_wake(elapsed: Duration, interval: Duration) -> bool {
 /// sleep-missed ticks instead of bursting them (Pitfall 5); a detected wake
 /// gap only logs — the current tick IS the single wake shot, keeping cadence
 /// instead of queuing stale rows.
+///
+/// D-17/D-19: the same task polls hardware idle every ~5 s and injects
+/// synthetic `IdleStart`/`ActivityResumed` signals on the same channel.
 async fn run_screenshot_scheduler(
     capture: CaptureHandle,
     tx: std::sync::mpsc::Sender<CaptureEvent>,
-    period: Duration,
+    period: Option<Duration>,
     screenshot_root: std::path::PathBuf,
     paused: Arc<AtomicBool>,
     shutdown_flag: Arc<AtomicBool>,
     shutdown: Arc<tokio::sync::Notify>,
+    idle_start_secs: u64,
+    idle_end_sustained_secs: u64,
 ) {
-    let mut ticker = tokio::time::interval(period);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ticker = period.map(|p| {
+        let mut t = tokio::time::interval(p);
+        t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        t
+    });
     // The first tick fires immediately: consume it for alignment so the
     // first real shot lands one full period after startup.
-    ticker.tick().await;
+    if let Some(t) = ticker.as_mut() {
+        t.tick().await;
+    }
+    let mut idle_ticker = tokio::time::interval(Duration::from_secs(IDLE_POLL_SECS));
+    let mut idle_state = IdleState::default();
     let mut last_tick = Instant::now();
     loop {
         tokio::select! {
@@ -442,7 +509,14 @@ async fn run_screenshot_scheduler(
                 info!("scheduler shutting down");
                 break;
             }
-            _ = ticker.tick() => {
+            // A disabled (0) interval parks this arm forever; idle still polls.
+            _ = async {
+                match ticker.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending().await,
+                }
+            } => {
+                let period = period.expect("disabled ticker never ticks");
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(last_tick);
                 last_tick = now;
@@ -484,12 +558,9 @@ async fn run_screenshot_scheduler(
                     break;
                 }
                 match shot {
-                    Ok(Ok(path)) => {
+                    Ok(Ok((path, scope))) => {
                         let event = CaptureEvent::new(
-                            CaptureEventKind::Screenshot {
-                                path,
-                                scope: rustwatch_core::ScreenshotScope::Screen,
-                            },
+                            CaptureEventKind::Screenshot { path, scope },
                             None,
                         );
                         if tx.send(event).is_err() {
@@ -503,6 +574,43 @@ async fn run_screenshot_scheduler(
                     Err(join_err) => {
                         error!(?join_err, "scheduler blocking task failed; exiting");
                         break;
+                    }
+                }
+            }
+            _ = idle_ticker.tick() => {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                // A broken probe reads as active: never idle on a broken probe.
+                let idle_secs =
+                    PlatformCapture::system_idle_seconds().unwrap_or(0.0) as u64;
+                match poll_idle(
+                    &mut idle_state,
+                    idle_secs,
+                    idle_start_secs,
+                    idle_end_sustained_secs,
+                    IDLE_POLL_SECS,
+                ) {
+                    IdleSignal::None => {}
+                    IdleSignal::WentIdle { idle_secs } => {
+                        info!(idle_secs, "idle start: closing active segment");
+                        let event = CaptureEvent::new(
+                            CaptureEventKind::IdleStart { idle_secs },
+                            None,
+                        );
+                        if tx.send(event).is_err() {
+                            error!("scheduler: writer gone; exiting");
+                            break;
+                        }
+                    }
+                    IdleSignal::BecameActive => {
+                        info!("sustained activity: idle over");
+                        let event =
+                            CaptureEvent::new(CaptureEventKind::ActivityResumed, None);
+                        if tx.send(event).is_err() {
+                            error!("scheduler: writer gone; exiting");
+                            break;
+                        }
                     }
                 }
             }
@@ -539,6 +647,76 @@ mod scheduler_tests {
         assert_eq!(interval_duration(0), None);
         assert_eq!(interval_duration(300), Some(Duration::from_secs(300)));
         assert_eq!(interval_duration(10), Some(Duration::from_secs(10)));
+    }
+
+    fn idle_poll(state: &mut IdleState, idle_secs: u64) -> IdleSignal {
+        poll_idle(state, idle_secs, 300, 30, 5)
+    }
+
+    /// Active use never trips idle, however long it runs.
+    #[test]
+    fn activity_never_goes_idle() {
+        let mut state = IdleState::default();
+        for _ in 0..100 {
+            assert!(matches!(idle_poll(&mut state, 2), IdleSignal::None));
+        }
+        assert!(!state.idle);
+    }
+
+    /// 300 s of quiet trips idle exactly once — repeat polls stay silent.
+    #[test]
+    fn quiet_trips_idle_once() {
+        let mut state = IdleState::default();
+        assert!(matches!(idle_poll(&mut state, 299), IdleSignal::None));
+        assert!(matches!(
+            idle_poll(&mut state, 301),
+            IdleSignal::WentIdle { idle_secs: 301 }
+        ));
+        assert!(state.idle);
+        assert!(matches!(idle_poll(&mut state, 400), IdleSignal::None));
+    }
+
+    /// D-19: 29 s of sustained activity (5 polls, 25 s streak) does NOT end
+    /// idle; the 30th second does.
+    #[test]
+    fn hysteresis_needs_thirty_sustained_seconds() {
+        let mut state = IdleState::default();
+        assert!(matches!(idle_poll(&mut state, 500), IdleSignal::WentIdle { .. }));
+        for _ in 0..5 {
+            assert!(matches!(idle_poll(&mut state, 1), IdleSignal::None));
+        }
+        assert!(state.idle);
+        assert!(matches!(idle_poll(&mut state, 1), IdleSignal::BecameActive));
+        assert!(!state.idle);
+    }
+
+    /// A stray nudge (one active poll, then quiet) resets the streak
+    /// instead of ending idle — the session never splits.
+    #[test]
+    fn stray_nudge_does_not_end_idle() {
+        let mut state = IdleState::default();
+        assert!(matches!(idle_poll(&mut state, 500), IdleSignal::WentIdle { .. }));
+        assert!(matches!(idle_poll(&mut state, 1), IdleSignal::None));
+        assert!(matches!(idle_poll(&mut state, 60), IdleSignal::None));
+        assert!(state.idle);
+        // The streak restarted: five more active polls still aren't enough.
+        for _ in 0..5 {
+            assert!(matches!(idle_poll(&mut state, 1), IdleSignal::None));
+        }
+        assert!(state.idle);
+        assert!(matches!(idle_poll(&mut state, 1), IdleSignal::BecameActive));
+    }
+
+    /// Full cycle: active → idle → active → idle again.
+    #[test]
+    fn idle_cycles_cleanly() {
+        let mut state = IdleState::default();
+        assert!(matches!(idle_poll(&mut state, 999), IdleSignal::WentIdle { .. }));
+        for _ in 0..6 {
+            idle_poll(&mut state, 0);
+        }
+        assert!(!state.idle);
+        assert!(matches!(idle_poll(&mut state, 999), IdleSignal::WentIdle { .. }));
     }
 
     /// Pitfall 5: after a simulated sleep (10 periods with no polls), Skip
@@ -622,12 +800,15 @@ fn persist_rest(
         }
     }
     if let CaptureEventKind::Screenshot { path, scope } = &event.kind {
+        // The open segment at shot time — None when no segment is active
+        // (e.g. a shot before any text/focus), same as before.
+        let segment_id = grouper.open_segment_id();
         if let Err(err) = store.insert_screenshot(&rustwatch_core::ScreenshotRecord {
             id: uuid::Uuid::new_v4().to_string(),
             path: path.clone(),
             scope: *scope,
             captured_at: event.timestamp,
-            segment_id: None,
+            segment_id,
         }) {
             error!(?err, "writer: insert_screenshot failed");
             counters
@@ -679,7 +860,16 @@ fn drain_retry_queue(
 #[cfg(test)]
 mod writer_tests {
     use super::*;
-    use rustwatch_core::CaptureEventKind;
+    use rustwatch_core::{AppContext, CaptureEventKind};
+
+    fn app(name: &str) -> AppContext {
+        AppContext {
+            app_name: name.to_string(),
+            window_title: format!("{name} window"),
+            process_id: 1,
+            bundle_id: None,
+        }
+    }
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -794,5 +984,70 @@ mod writer_tests {
             true,
         );
         assert_eq!((redelivered, dropped), (0, 0));
+    }
+
+    /// Screenshots link to the open segment instead of hardcoding None —
+    /// and stay None when no segment is open (no crash, no invention).
+    #[test]
+    fn screenshot_row_carries_open_segment_id() {
+        let store = test_store();
+        let mut grouper = SegmentGrouper::new();
+        let mut queue = RetryQueue::new();
+        let counters = WriterCounters::new();
+        let ctx = app("Safari");
+
+        // A shot with no open segment links None, like before.
+        handle_event(
+            &store,
+            &mut grouper,
+            &mut queue,
+            &counters,
+            CaptureEvent::new(
+                CaptureEventKind::Screenshot {
+                    path: "/tmp/early.png".into(),
+                    scope: rustwatch_core::ScreenshotScope::Screen,
+                },
+                Some(ctx.clone()),
+            ),
+        );
+        // Focus opens a segment; the next shot links to it.
+        handle_event(
+            &store,
+            &mut grouper,
+            &mut queue,
+            &counters,
+            CaptureEvent::new(
+                CaptureEventKind::FocusChange {
+                    from: None,
+                    to: ctx.clone(),
+                },
+                Some(ctx.clone()),
+            ),
+        );
+        let open = grouper.open_segment_id().expect("segment open");
+        handle_event(
+            &store,
+            &mut grouper,
+            &mut queue,
+            &counters,
+            CaptureEvent::new(
+                CaptureEventKind::Screenshot {
+                    path: "/tmp/linked.png".into(),
+                    scope: rustwatch_core::ScreenshotScope::Window,
+                },
+                Some(ctx.clone()),
+            ),
+        );
+
+        let mut stmt = store
+            .connection()
+            .prepare("SELECT segment_id FROM screenshots ORDER BY rowid")
+            .unwrap();
+        let links: Vec<Option<String>> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(links, vec![None, Some(open)]);
     }
 }

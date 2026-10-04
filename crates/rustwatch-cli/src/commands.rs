@@ -277,7 +277,7 @@ pub async fn screenshot(paths: &DataPaths, window: bool, screen: bool) -> anyhow
         ScreenshotScope::Window
     };
     let handle = CaptureHandle::new(Vec::new())?;
-    let path = handle.capture_screenshot(scope, paths.screenshots.clone())?;
+    let (path, _) = handle.capture_screenshot(scope, paths.screenshots.clone())?;
     println!("Saved screenshot: {}", path.display());
     Ok(())
 }

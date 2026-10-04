@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 
 use rustwatch_core::{
     events::{AppContext, CaptureEvent, CaptureEventKind, ScreenshotScope},
@@ -75,6 +76,7 @@ impl PlatformCapture {
         tx: EventSender<CaptureEvent>,
         poll_focus_ms: u64,
         screenshot_on_focus_change: bool,
+        min_interval_secs: u64,
         screenshot_root: PathBuf,
     ) -> Result<()> {
         let exclude = self.exclude_apps.clone();
@@ -107,6 +109,7 @@ impl PlatformCapture {
                     tx_focus,
                     poll_focus_ms,
                     screenshot_on_focus_change,
+                    min_interval_secs,
                     screenshot_root,
                     exclude,
                     paused_focus,
@@ -124,8 +127,35 @@ impl PlatformCapture {
         Ok(())
     }
 
-    pub fn capture_screenshot(&self, scope: ScreenshotScope, root: PathBuf) -> Result<PathBuf> {
+    pub fn capture_screenshot(
+        &self,
+        scope: ScreenshotScope,
+        root: PathBuf,
+    ) -> Result<(PathBuf, ScreenshotScope)> {
         capture_to_disk(scope, root)
+    }
+
+    /// D-17 hardware idle probe: seconds since the last HID input event,
+    /// straight from Quartz. `None` when the value is unusable — the
+    /// scheduler treats that as active (never idle on a broken probe).
+    ///
+    /// COMPILE-TIME verification (01-02): core-graphics 0.23.2 exposes no
+    /// `secondsSinceLastEventType` binding (checked vendored sources), so
+    /// this declares the 10-line `extern "C"` fallback from RESEARCH.md.
+    /// `kCGEventSourceStateHIDSystemState` (1) + `kCGAnyInputEventType`
+    /// (`~0u`) is the standard idle-time pairing.
+    pub fn system_idle_seconds() -> Option<f64> {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+        }
+        // SAFETY: pure Quartz getter; constant args are always valid.
+        let secs = unsafe { CGEventSourceSecondsSinceLastEventType(1, u32::MAX) };
+        if secs.is_finite() && secs >= 0.0 {
+            Some(secs)
+        } else {
+            None
+        }
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -317,11 +347,15 @@ fn run_focus_loop(
     tx: EventSender<CaptureEvent>,
     poll_focus_ms: u64,
     screenshot_on_focus_change: bool,
+    min_interval_secs: u64,
     screenshot_root: PathBuf,
     exclude_apps: Vec<String>,
     paused: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut last: Option<AppContext> = None;
+    // D-09 throttle state: timestamps of recent focus-loop shots.
+    let mut shots: Vec<Instant> = Vec::new();
+    let min_interval = Duration::from_secs(min_interval_secs);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(poll_focus_ms));
         if paused.load(Ordering::Relaxed) {
@@ -346,16 +380,23 @@ fn run_focus_loop(
             let _ = tx.send(change);
 
             if screenshot_on_focus_change {
-                if let Ok(path) = capture_to_disk(ScreenshotScope::Window, screenshot_root.clone())
-                {
-                    let shot = CaptureEvent::new(
-                        CaptureEventKind::Screenshot {
-                            path,
-                            scope: ScreenshotScope::Window,
-                        },
-                        Some(current.clone()),
-                    );
-                    let _ = tx.send(shot);
+                // D-09: 2 s cooldown + at most 3 shots per rolling 10 s, so
+                // Alt-Tab spam can never fill the disk (T-02-03). History is
+                // pruned to the burst window to stay bounded.
+                let now = Instant::now();
+                shots.retain(|t| now.saturating_duration_since(*t) <= FOCUS_BURST_WINDOW);
+                if should_shoot(now, &shots, min_interval) {
+                    match capture_to_disk(ScreenshotScope::Window, screenshot_root.clone()) {
+                        Ok((path, scope)) => {
+                            shots.push(now);
+                            let shot = CaptureEvent::new(
+                                CaptureEventKind::Screenshot { path, scope },
+                                Some(current.clone()),
+                            );
+                            let _ = tx.send(shot);
+                        }
+                        Err(err) => debug!(?err, "focus-loop screenshot skipped"),
+                    }
                 }
             }
 
@@ -466,7 +507,26 @@ fn to_logical_key(key: keytap::Key) -> Option<LogicalKey> {
     Some(logical)
 }
 
-fn capture_to_disk(scope: ScreenshotScope, root: PathBuf) -> Result<PathBuf> {
+/// D-09 window-change throttle: at most 3 shots per rolling 10 s window
+/// plus the `min_interval_secs` cooldown. Pure over injected `Instant`s —
+/// tests drive it with arithmetic, never a clock.
+const FOCUS_BURST_MAX: usize = 3;
+const FOCUS_BURST_WINDOW: Duration = Duration::from_secs(10);
+
+fn should_shoot(now: Instant, history: &[Instant], min_interval: Duration) -> bool {
+    if let Some(&last) = history.last() {
+        if now.saturating_duration_since(last) < min_interval {
+            return false;
+        }
+    }
+    history
+        .iter()
+        .filter(|t| now.saturating_duration_since(**t) <= FOCUS_BURST_WINDOW)
+        .count()
+        < FOCUS_BURST_MAX
+}
+
+fn capture_to_disk(scope: ScreenshotScope, root: PathBuf) -> Result<(PathBuf, ScreenshotScope)> {
     use chrono::Utc;
     use xcap::{Monitor, Window};
 
@@ -479,12 +539,15 @@ fn capture_to_disk(scope: ScreenshotScope, root: PathBuf) -> Result<PathBuf> {
         rustwatch_core::Error::Other("screenshot capture lock poisoned".into())
     })?;
 
-    let date_dir = root.join(Utc::now().format("%Y-%m-%d").to_string());
+    // SYS-01: the date dir comes from DataPaths (sole path authority), not
+    // an inline format duplicate.
+    let date_dir = rustwatch_core::DataPaths::new(Some(root.clone()))?
+        .screenshot_dir_for_date(Utc::now().date_naive());
     std::fs::create_dir_all(&date_dir).map_err(rustwatch_core::Error::from)?;
     let filename = format!("{}-{}.png", Utc::now().timestamp_millis(), scope_label(scope));
     let path = date_dir.join(filename);
 
-    match scope {
+    let actual = match scope {
         ScreenshotScope::Screen => {
             let monitors = Monitor::all().map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
             let monitor = monitors.into_iter().next().ok_or_else(|| {
@@ -496,33 +559,46 @@ fn capture_to_disk(scope: ScreenshotScope, root: PathBuf) -> Result<PathBuf> {
             image
                 .save(&path)
                 .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
+            ScreenshotScope::Screen
         }
         ScreenshotScope::Window => {
             let windows = Window::all().map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
-            let window = windows.into_iter().find(|w| w.is_focused().unwrap_or(false));
-            if let Some(window) = window {
-                let image = window
-                    .capture_image()
-                    .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
-                image
-                    .save(&path)
-                    .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
-            } else if let Some(monitor) = Monitor::all()
-                .ok()
-                .and_then(|m| m.into_iter().next())
-            {
-                let image = monitor
-                    .capture_image()
-                    .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
-                image
-                    .save(&path)
-                    .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
+            match windows.into_iter().find(|w| w.is_focused().unwrap_or(false)) {
+                Some(window) => {
+                    let image = window
+                        .capture_image()
+                        .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
+                    image
+                        .save(&path)
+                        .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
+                    ScreenshotScope::Window
+                }
+                // T-02-01: the fallback captures the FULL screen, so the row
+                // says Screen — never mislabel fullscreen as Window. And a
+                // missing monitor fails loudly instead of writing a row for a
+                // file that was never created.
+                None => {
+                    let monitor = Monitor::all()
+                        .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            rustwatch_core::Error::Other("no focused window and no monitor".into())
+                        })?;
+                    let image = monitor
+                        .capture_image()
+                        .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
+                    image
+                        .save(&path)
+                        .map_err(|e| rustwatch_core::Error::Other(e.to_string()))?;
+                    ScreenshotScope::Screen
+                }
             }
         }
-    }
+    };
 
     debug!(path = %path.display(), "screenshot saved");
-    Ok(path)
+    Ok((path, actual))
 }
 
 fn scope_label(scope: ScreenshotScope) -> &'static str {
@@ -540,9 +616,10 @@ pub fn hash_content(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{translate_key_events, KeyState};
+    use super::{should_shoot, translate_key_events, KeyState};
     use keytap::Key;
     use rustwatch_core::events::{AppContext, CaptureEvent, CaptureEventKind};
+    use std::time::{Duration, Instant};
 
     fn app(name: &str) -> AppContext {
         AppContext {
@@ -825,5 +902,72 @@ mod tests {
     fn space_and_enter_round_trip() {
         let events = run(&[down(Key::Space), down(Key::Enter)], &[], "Safari");
         assert_eq!(text_of(&events), " \n");
+    }
+
+    /// D-09 throttle over a fake clock: cooldown + burst cap.
+    fn history_at(now: Instant, offsets_secs: &[u64]) -> Vec<Instant> {
+        offsets_secs
+            .iter()
+            .map(|s| now - Duration::from_secs(*s))
+            .collect()
+    }
+
+    #[test]
+    fn first_shot_always_fires() {
+        let now = Instant::now();
+        assert!(should_shoot(now, &[], Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn cooldown_blocks_rapid_refire() {
+        let now = Instant::now();
+        // Last shot 1 s ago: 2 s cooldown says no.
+        assert!(!should_shoot(now, &history_at(now, &[1]), Duration::from_secs(2)));
+        // Last shot exactly at the cooldown boundary: yes.
+        assert!(should_shoot(now, &history_at(now, &[2]), Duration::from_secs(2)));
+        // Last shot 3 s ago: yes.
+        assert!(should_shoot(now, &history_at(now, &[3]), Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn burst_cap_allows_three_per_ten_seconds() {
+        let now = Instant::now();
+        // Two shots in the window: room for a third (past cooldown).
+        assert!(should_shoot(now, &history_at(now, &[9, 6]), Duration::from_secs(2)));
+        // Three shots in the window: capped.
+        assert!(!should_shoot(now, &history_at(now, &[9, 6, 3]), Duration::from_secs(2)));
+        // A 4th inside the window is capped even past cooldown.
+        assert!(!should_shoot(now, &history_at(now, &[9, 6, 4, 2]), Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn burst_window_slides() {
+        let now = Instant::now();
+        // 3 old shots aged out of the 10 s window: fire again.
+        assert!(should_shoot(now, &history_at(now, &[30, 20, 11]), Duration::from_secs(2)));
+        // But 3 shots inside the window still cap.
+        assert!(!should_shoot(now, &history_at(now, &[9, 8, 1]), Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn zero_cooldown_leaves_only_the_burst_cap() {
+        let now = Instant::now();
+        assert!(should_shoot(now, &history_at(now, &[5]), Duration::ZERO));
+        assert!(!should_shoot(
+            now,
+            &history_at(now, &[9, 5, 1]),
+            Duration::ZERO
+        ));
+    }
+
+    /// The Quartz idle probe links and returns a sane value. (Prints the
+    /// live reading with --nocapture: the ground truth for whether the
+    /// test box is HID-active.)
+    #[test]
+    fn idle_probe_links_and_returns_finite() {
+        let secs = super::PlatformCapture::system_idle_seconds()
+            .expect("CGEventSourceSecondsSinceLastEventType must answer");
+        eprintln!("live idle reading: {secs:.1}s since last HID input");
+        assert!(secs.is_finite() && secs >= 0.0);
     }
 }

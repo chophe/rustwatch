@@ -37,6 +37,7 @@ impl PlatformCapture {
         _tx: std::sync::mpsc::Sender<CaptureEvent>,
         _poll_focus_ms: u64,
         _screenshot_on_focus_change: bool,
+        _min_interval_secs: u64,
         _screenshot_root: PathBuf,
     ) -> Result<()> {
         Err(rustwatch_core::Error::UnsupportedPlatform(
@@ -48,10 +49,15 @@ impl PlatformCapture {
         &self,
         _scope: ScreenshotScope,
         _root: PathBuf,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, ScreenshotScope)> {
         Err(rustwatch_core::Error::UnsupportedPlatform(
             "capture is only implemented for macOS in v0.1".into(),
         ))
+    }
+
+    pub fn system_idle_seconds() -> Option<f64> {
+        // No Quartz off macOS: never idle, never suppress.
+        None
     }
 
     pub fn set_paused(&self, _paused: bool) {}
