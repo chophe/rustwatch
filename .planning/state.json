@@ -1,0 +1,38 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": null,
+  "phases": [
+    {
+      "number": "1",
+      "name": "Reliable Capture & System Foundation",
+      "status": "pending"
+    },
+    {
+      "number": "2",
+      "name": "Privacy Enforcement",
+      "status": "pending"
+    },
+    {
+      "number": "3",
+      "name": "Classification & Local Embeddings",
+      "status": "pending"
+    },
+    {
+      "number": "4",
+      "name": "Memory Search & Storage",
+      "status": "pending"
+    },
+    {
+      "number": "5",
+      "name": "Surfaces — Ask, Dashboard, MCP",
+      "status": "pending"
+    }
+  ],
+  "next": {
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 1 of 5 · 0% · executing"
+  },
+  "updated_at": "2026-10-04T14:28:37.023Z"
+}
