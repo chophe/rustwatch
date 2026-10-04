@@ -14,6 +14,7 @@ use rustwatch_core::{
     RetryQueue, SegmentGrouper, Store,
 };
 use tokio::net::UnixListener;
+use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -67,6 +68,10 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     std::fs::write(&paths.pid_file, std::process::id().to_string())?;
 
     let (event_tx, event_rx) = std::sync::mpsc::channel::<CaptureEvent>();
+    // Cloned before `start` consumes the original: the interval scheduler
+    // emits onto the SAME channel as keyboard/focus events (uniform
+    // retry/loss accounting — no second code path).
+    let scheduler_tx = event_tx.clone();
     let capture = CaptureHandle::new(config.capture.exclude_apps.clone())?;
     let capture_for_ipc = capture.clone();
     let capture_for_watch = capture.clone();
@@ -102,7 +107,10 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
             }
             sig_capture.set_paused(true);
             sig_shutdown.store(true, Ordering::SeqCst);
-            sig_notify.notify_one();
+            // Wakes EVERY waiter (accept loop + scheduler), not just one:
+            // `notify_one` could wake the scheduler and leave the accept
+            // loop parked forever.
+            sig_notify.notify_waiters();
         });
     }
 
@@ -174,6 +182,20 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         })
         .context("spawn writer thread")?;
 
+    // CAPT-02: interval screenshots ride the same mpsc channel as capture
+    // events. A 0 interval disables interval shots entirely.
+    let scheduler_handle = interval_duration(config.capture.screenshot_interval_secs).map(|period| {
+        tokio::spawn(run_screenshot_scheduler(
+            capture.clone(),
+            scheduler_tx,
+            period,
+            paths.screenshots.clone(),
+            Arc::clone(&paused),
+            Arc::clone(&shutdown),
+            Arc::clone(&shutdown_notify),
+        ))
+    });
+
     let listener = UnixListener::bind(&paths.socket).context("bind daemon socket")?;
     // T-01-03: the socket streams full keystroke/screen history — owner-only
     // after every bind (covers pre-existing sockets too).
@@ -203,6 +225,14 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                 if !shutdown.load(Ordering::SeqCst) && !capture_for_watch.threads_alive() {
                     error!("capture thread died unexpectedly; exiting for restart");
                     std::process::exit(1);
+                }
+                // D-06 covers the scheduler too: a dead interval task must
+                // restart the daemon, never silently stop screenshots.
+                if let Some(handle) = &scheduler_handle {
+                    if handle.is_finished() && !shutdown.load(Ordering::SeqCst) {
+                        error!("scheduler task died unexpectedly; exiting for restart");
+                        std::process::exit(1);
+                    }
                 }
             }
             res = listener.accept() => {
@@ -310,6 +340,12 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
+    // The scheduler broke out of its select! on the shutdown notification;
+    // await it so an in-flight interval shot finishes before the runtime
+    // drops (a detached send failure is harmless — the writer is gone).
+    if let Some(handle) = scheduler_handle {
+        let _ = handle.await;
+    }
     Ok(())
 }
 
@@ -352,6 +388,180 @@ impl WriterCounters {
         if overflow > 0 {
             self.dropped.fetch_add(overflow, Ordering::Relaxed);
         }
+    }
+}
+
+/// D-12 slack: a tick later than `interval + slack` implies the machine
+/// slept (normal scheduling jitter is milliseconds, never seconds).
+const WAKE_SLACK: Duration = Duration::from_secs(5);
+
+/// CAPT-02 knob mapping: 0 disables interval shots, anything else is the
+/// tick period. Pure so the disable path is unit-testable without a timer.
+fn interval_duration(secs: u64) -> Option<Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+/// D-12 wake detection over the monotonic clock: `elapsed` much larger than
+/// the interval (plus slack) means missed ticks were slept through, not
+/// merely jittered. Pure — the scheduler injects `Instant`s, tests inject
+/// arithmetic.
+fn detect_wake(elapsed: Duration, interval: Duration) -> bool {
+    elapsed > interval + WAKE_SLACK
+}
+
+/// CAPT-02/D-12: one `tokio::time::interval` ticking at `period`.
+///
+/// Every tick shoots EXACTLY once via `spawn_blocking` (xcap is blocking)
+/// and emits a normal `Screenshot` event on the shared channel, so interval
+/// shots get the writer's retry/loss accounting for free. `Skip` discards
+/// sleep-missed ticks instead of bursting them (Pitfall 5); a detected wake
+/// gap only logs — the current tick IS the single wake shot, keeping cadence
+/// instead of queuing stale rows.
+async fn run_screenshot_scheduler(
+    capture: CaptureHandle,
+    tx: std::sync::mpsc::Sender<CaptureEvent>,
+    period: Duration,
+    screenshot_root: std::path::PathBuf,
+    paused: Arc<AtomicBool>,
+    shutdown_flag: Arc<AtomicBool>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The first tick fires immediately: consume it for alignment so the
+    // first real shot lands one full period after startup.
+    ticker.tick().await;
+    let mut last_tick = Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                info!("scheduler shutting down");
+                break;
+            }
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let elapsed = now.saturating_duration_since(last_tick);
+                last_tick = now;
+                // The Notify is lossy: a SIGTERM landing mid-capture misses
+                // the waiter, so the flag (set synchronously by the signal
+                // handler) is the authoritative stop — never shoot post-TERM.
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if detect_wake(elapsed, period) {
+                    info!(elapsed = ?elapsed, "wake gap detected: single wake shot, backlog skipped");
+                }
+                let pending = {
+                    let capture = capture.clone();
+                    let root = screenshot_root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        capture.capture_screenshot(
+                            rustwatch_core::ScreenshotScope::Screen,
+                            root,
+                        )
+                    })
+                };
+                // Abandon (don't await) an in-flight capture on shutdown:
+                // the detached thread finishes its file write harmlessly and
+                // its send fails silently against the drained writer, while
+                // SIGTERM-to-exit stays in milliseconds, not capture-length.
+                let shot = tokio::select! {
+                    result = pending => Some(result),
+                    _ = shutdown.notified() => None,
+                };
+                let Some(shot) = shot else {
+                    info!("scheduler shutting down mid-capture");
+                    break;
+                };
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                match shot {
+                    Ok(Ok(path)) => {
+                        let event = CaptureEvent::new(
+                            CaptureEventKind::Screenshot {
+                                path,
+                                scope: rustwatch_core::ScreenshotScope::Screen,
+                            },
+                            None,
+                        );
+                        if tx.send(event).is_err() {
+                            error!("scheduler: writer gone; exiting");
+                            break;
+                        }
+                    }
+                    // D-14: no Screen Recording grant (or headless CI) skips
+                    // the shot quietly — never a counter, never a crash.
+                    Ok(Err(err)) => tracing::debug!(?err, "scheduler: interval shot skipped"),
+                    Err(join_err) => {
+                        error!(?join_err, "scheduler blocking task failed; exiting");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    /// Just under the boundary is jitter, not sleep.
+    #[test]
+    fn normal_tick_is_not_wake() {
+        let interval = Duration::from_secs(300);
+        assert!(!detect_wake(Duration::from_secs(300), interval));
+        assert!(!detect_wake(Duration::from_secs(304), interval));
+        assert!(!detect_wake(interval + WAKE_SLACK, interval));
+    }
+
+    /// Just over the boundary (plus a 2-minute nap on a 10 s test cadence)
+    /// is unambiguously sleep.
+    #[test]
+    fn gap_beyond_interval_plus_slack_is_wake() {
+        let interval = Duration::from_secs(300);
+        assert!(detect_wake(interval + WAKE_SLACK + Duration::from_millis(1), interval));
+        assert!(detect_wake(Duration::from_secs(120), Duration::from_secs(10)));
+        assert!(detect_wake(Duration::from_secs(3600), interval));
+    }
+
+    /// 0 disables interval shots; anything else ticks at face value.
+    #[test]
+    fn interval_zero_disables() {
+        assert_eq!(interval_duration(0), None);
+        assert_eq!(interval_duration(300), Some(Duration::from_secs(300)));
+        assert_eq!(interval_duration(10), Some(Duration::from_secs(10)));
+    }
+
+    /// Pitfall 5: after a simulated sleep (10 periods with no polls), Skip
+    /// yields exactly one ready tick — the wake slot — and the next tick
+    /// pends a full period. No backlog burst, ever.
+    #[tokio::test]
+    async fn skip_behavior_produces_no_backlog() {
+        tokio::time::pause();
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await; // t=0 alignment tick
+        tokio::time::advance(Duration::from_secs(10)).await; // sleep
+        ticker.tick().await; // the single wake-slot tick
+        // The next tick must NOT be immediately ready: with Burst it would
+        // be (backlog), with Skip it pends until the next multiple.
+        use std::future::Future;
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut next = Box::pin(ticker.tick());
+        assert!(
+            matches!(next.as_mut().poll(&mut cx), std::task::Poll::Pending),
+            "Skip must discard slept-through ticks, not queue them"
+        );
     }
 }
 

@@ -470,6 +470,15 @@ fn capture_to_disk(scope: ScreenshotScope, root: PathBuf) -> Result<PathBuf> {
     use chrono::Utc;
     use xcap::{Monitor, Window};
 
+    // Live finding (01-02 tracer): concurrent xcap captures stall each
+    // other (12–22 s vs same-second sequential). ScreenCaptureKit calls
+    // serialize here so interval, focus-change, and on-demand shots can
+    // never overlap — a slow capture delays, never deadlocks.
+    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CAPTURE_LOCK.lock().map_err(|_| {
+        rustwatch_core::Error::Other("screenshot capture lock poisoned".into())
+    })?;
+
     let date_dir = root.join(Utc::now().format("%Y-%m-%d").to_string());
     std::fs::create_dir_all(&date_dir).map_err(rustwatch_core::Error::from)?;
     let filename = format!("{}-{}.png", Utc::now().timestamp_millis(), scope_label(scope));
