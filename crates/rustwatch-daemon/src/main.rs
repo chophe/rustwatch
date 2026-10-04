@@ -56,6 +56,15 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     }
 
     let store = Store::open(&paths.sqlite)?;
+    // 01-03 tracer: real TCC probe results live in daemon state from
+    // startup, so `status`/TUI/doctor render truth instead of hardcoded
+    // booleans. The 30 s re-probe refresh (task 2) mutates this snapshot.
+    let daemon_permissions = CaptureHandle::permissions_with_prompted(&config.permissions);
+    let permissions_snapshot = rustwatch_core::PermissionsState {
+        input_monitoring: daemon_permissions.input_monitoring,
+        accessibility: daemon_permissions.accessibility,
+        screen_recording: daemon_permissions.screen_recording,
+    };
     let paused = Arc::new(AtomicBool::new(false));
     let counters = WriterCounters::new();
     let events_captured = Arc::clone(&counters.events);
@@ -253,6 +262,7 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         let dropped_ref = Arc::clone(&dropped_events);
         let queued_ref = Arc::clone(&queued);
         let started = started_at.clone();
+        let permissions_state = permissions_snapshot;
         let capture_ref = paths.screenshots.clone();
         let capture_handle = capture_for_ipc.clone();
         let sqlite_path = paths.sqlite.clone();
@@ -293,6 +303,7 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                                     dropped_events,
                                     queued,
                                 ),
+                                permissions: permissions_state,
                             },
                         }
                     }

@@ -6,8 +6,9 @@ use std::path::PathBuf;use std::sync::{
 use std::time::{Duration, Instant};
 
 use rustwatch_core::{
+    classify_grant,
     events::{AppContext, CaptureEvent, CaptureEventKind, ScreenshotScope},
-    is_excluded, key_to_text, LogicalKey, Modifiers, Result,
+    is_excluded, key_to_text, LogicalKey, Modifiers, PermissionsConfig, PermissionState, Result,
 };
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -16,9 +17,9 @@ pub type EventSender<T> = std::sync::mpsc::Sender<T>;
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsReport {
-    pub input_monitoring: bool,
-    pub accessibility: bool,
-    pub screen_recording: bool,
+    pub input_monitoring: PermissionState,
+    pub accessibility: PermissionState,
+    pub screen_recording: PermissionState,
     pub notes: Vec<String>,
 }
 
@@ -60,15 +61,16 @@ impl PlatformCapture {
     }
 
     pub fn permissions() -> PermissionsReport {
-        let mut notes = Vec::new();
-        notes.push("Grant Input Monitoring, Accessibility, and Screen Recording in System Settings.".into());
-        notes.push("After granting Screen Recording, restart rustwatchd.".into());
-        PermissionsReport {
-            input_monitoring: false,
-            accessibility: false,
-            screen_recording: false,
-            notes,
-        }
+        Self::permissions_with_prompted(&PermissionsConfig::default())
+    }
+
+    /// Real Screen Recording probe end-to-end (01-03 tracer); Input
+    /// Monitoring and Accessibility stay undetermined until task 2 wires
+    /// their probes. `prompted` is the daemon's `[permissions] prompted_*`
+    /// bookkeeping: a `false` probe with no prior prompt is undetermined,
+    /// with a prior prompt is denied (see `classify_grant`).
+    pub fn permissions_with_prompted(prompted: &PermissionsConfig) -> PermissionsReport {
+        build_report(probe_screen_recording(), prompted)
     }
 
     pub fn start(
@@ -180,6 +182,46 @@ impl PlatformCapture {
 
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
+    }
+}
+
+// COMPILE-TIME verification (01-03 tracer): neither core-graphics 0.23.2
+// nor any other crate in the tree exposes `CGPreflightScreenCaptureAccess`
+// or `AXIsProcessTrustedWithOptions` (checked the vendored registry
+// sources) — so both probes below declare minimal `extern "C"` fallbacks,
+// the same pattern 01-02 used for the idle probe. Zero new crates, zero
+// new supply-chain surface (threat T-03-SC).
+//
+// API choice record: `CGPreflightScreenCaptureAccess` (macOS 10.15+) is the
+// CHECK variant — true means granted, false means denied-or-undetermined,
+// and it never prompts. The REQUEST variant
+// (`CGRequestScreenCaptureAccess`, which prompts when undetermined) is
+// reserved for the task-2 first-run preflight, gated by `wants_prompt`.
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> u8;
+}
+
+/// Raw Screen Recording grant probe: true = granted. False folds
+/// denied/undetermined together — the caller splits them with
+/// `classify_grant` using the persisted `prompted_*` flags.
+fn probe_screen_recording() -> bool {
+    // SAFETY: pure Quartz getter; no arguments, no out-pointers.
+    unsafe { CGPreflightScreenCaptureAccess() != 0 }
+}
+
+/// Pure report assembly over an INJECTED probe result, so the mapping is
+/// unit-testable without touching TCC. The live path calls this with the
+/// real `probe_screen_recording()` value.
+fn build_report(screen_granted: bool, prompted: &PermissionsConfig) -> PermissionsReport {
+    let mut notes = Vec::new();
+    notes.push("Grant Input Monitoring, Accessibility, and Screen Recording in System Settings.".into());
+    notes.push("After granting Screen Recording, restart rustwatchd.".into());
+    PermissionsReport {
+        input_monitoring: PermissionState::Undetermined,
+        accessibility: PermissionState::Undetermined,
+        screen_recording: classify_grant(screen_granted, prompted.prompted_screen_recording),
+        notes,
     }
 }
 
@@ -1144,6 +1186,40 @@ mod tests {
             &history_at(now, &[9, 5, 1]),
             Duration::ZERO
         ));
+    }
+
+    /// The Quartz TCC probe links and answers without prompting.
+    #[test]
+    fn screen_probe_links_and_answers() {
+        // Value depends on this machine's grant — the assertion is only
+        // that the FFI call returns instead of crashing or prompting.
+        let _ = super::probe_screen_recording();
+    }
+
+    /// Injected probe results flow to the true three-state value: granted
+    /// probes stay granted, unprompted denials read undetermined, prompted
+    /// denials read denied. The other two grants stay undetermined until
+    /// task 2 wires their probes.
+    #[test]
+    fn injected_screen_probe_maps_to_three_states() {
+        use rustwatch_core::{PermissionsConfig, PermissionState};
+        let fresh = PermissionsConfig::default();
+        let granted = super::build_report(true, &fresh);
+        assert_eq!(granted.screen_recording, PermissionState::Granted);
+        assert_eq!(granted.input_monitoring, PermissionState::Undetermined);
+        assert_eq!(granted.accessibility, PermissionState::Undetermined);
+
+        let never_asked = super::build_report(false, &fresh);
+        assert_eq!(never_asked.screen_recording, PermissionState::Undetermined);
+
+        let asked = PermissionsConfig {
+            prompted_screen_recording: true,
+            ..Default::default()
+        };
+        let denied = super::build_report(false, &asked);
+        assert_eq!(denied.screen_recording, PermissionState::Denied);
+        // Prompting one grant never flips the others.
+        assert_eq!(denied.input_monitoring, PermissionState::Undetermined);
     }
 
     /// The Quartz idle probe links and returns a sane value.

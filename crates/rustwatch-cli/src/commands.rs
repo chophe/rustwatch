@@ -213,6 +213,14 @@ pub async fn status(paths: &DataPaths, config: &Config) -> anyhow::Result<()> {
                     println!("  queued for retry: {}", state.queued);
                 }
             }
+            // D-16 permission line: partial capture never looks like full
+            // capture. Detail (Settings fix per grant) lives in `doctor`.
+            let perm_banner = state.permissions.banner();
+            if state.permissions.all_granted() {
+                println!("{}", perm_banner.green());
+            } else {
+                println!("{}", perm_banner.yellow());
+            }
         }
     } else {
         println!("{}", "Daemon: not running".yellow());
@@ -223,20 +231,23 @@ pub async fn status(paths: &DataPaths, config: &Config) -> anyhow::Result<()> {
 pub fn permissions() -> anyhow::Result<()> {
     let report = CaptureHandle::permissions();
     println!("{}", style("macOS permissions checklist").bold());
-    println!("  Input Monitoring:  {}", flag(report.input_monitoring));
-    println!("  Accessibility:     {}", flag(report.accessibility));
-    println!("  Screen Recording:  {}", flag(report.screen_recording));
+    println!("  Input Monitoring:  {}", perm_flag(report.input_monitoring));
+    println!("  Accessibility:     {}", perm_flag(report.accessibility));
+    println!("  Screen Recording:  {}", perm_flag(report.screen_recording));
     for note in report.notes {
         println!("  - {note}");
     }
     Ok(())
 }
 
-fn flag(ok: bool) -> String {
-    if ok {
-        "granted".green().to_string()
-    } else {
-        "missing".red().to_string()
+/// D-16 three-state rendering: denied and never-prompted are different facts
+/// with different fixes (`doctor` prints the per-grant fix).
+fn perm_flag(state: rustwatch_core::PermissionState) -> String {
+    use rustwatch_core::PermissionState;
+    match state {
+        PermissionState::Granted => "granted".green().to_string(),
+        PermissionState::Denied => "denied".red().to_string(),
+        PermissionState::Undetermined => "undetermined".yellow().to_string(),
     }
 }
 
@@ -529,6 +540,15 @@ mod commands_tests {
     #[test]
     fn short_cjk_text_passes_through() {
         assert_eq!(snippet_for("日本語テスト"), "日本語テスト");
+    }
+
+    /// D-16: denied and never-prompted render as different facts.
+    #[test]
+    fn perm_flag_distinguishes_three_states() {
+        use rustwatch_core::PermissionState;
+        assert!(super::perm_flag(PermissionState::Granted).contains("granted"));
+        assert!(super::perm_flag(PermissionState::Denied).contains("denied"));
+        assert!(super::perm_flag(PermissionState::Undetermined).contains("undetermined"));
     }
 
     /// D-11: typing + Enter saves the typed text.

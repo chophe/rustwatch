@@ -70,4 +70,10 @@ impl CaptureHandle {
     pub fn permissions() -> PermissionsReport {
         PlatformCapture::permissions()
     }
+
+    pub fn permissions_with_prompted(
+        prompted: &rustwatch_core::PermissionsConfig,
+    ) -> PermissionsReport {
+        PlatformCapture::permissions_with_prompted(prompted)
+    }
 }

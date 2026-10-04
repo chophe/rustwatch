@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use rustwatch_core::{CaptureEvent, Result, ScreenshotScope};
+use rustwatch_core::{CaptureEvent, PermissionState, Result, ScreenshotScope};
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsReport {
-    pub input_monitoring: bool,
-    pub accessibility: bool,
-    pub screen_recording: bool,
+    pub input_monitoring: PermissionState,
+    pub accessibility: PermissionState,
+    pub screen_recording: PermissionState,
     pub notes: Vec<String>,
 }
 
@@ -30,6 +30,12 @@ impl PlatformCapture {
             notes: vec!["macOS capture is not available on this platform.".into()],
             ..Default::default()
         }
+    }
+
+    pub fn permissions_with_prompted(
+        _prompted: &rustwatch_core::PermissionsConfig,
+    ) -> PermissionsReport {
+        Self::permissions()
     }
 
     pub fn start(

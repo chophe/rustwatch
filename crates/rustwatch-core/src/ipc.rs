@@ -23,6 +23,11 @@ pub struct DaemonState {
     pub queued: u64,
     #[serde(default)]
     pub capture_health: String,
+    /// 01-03 wire-type change (with 01-01 counters): the daemon populates
+    /// this at startup from real TCC probes; CLI/TUI/doctor only render it.
+    /// `#[serde(default)]` keeps older daemon replies parseable.
+    #[serde(default)]
+    pub permissions: crate::PermissionsState,
 }
 
 impl DaemonState {
