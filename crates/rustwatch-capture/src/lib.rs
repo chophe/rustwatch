@@ -30,14 +30,12 @@ impl CaptureHandle {
         &self,
         tx: std::sync::mpsc::Sender<CaptureEvent>,
         poll_focus_ms: u64,
-        accessibility_poll_ms: u64,
         screenshot_on_focus_change: bool,
         screenshot_root: PathBuf,
     ) -> Result<()> {
         self.inner.start(
             tx,
             poll_focus_ms,
-            accessibility_poll_ms,
             screenshot_on_focus_change,
             screenshot_root,
         )

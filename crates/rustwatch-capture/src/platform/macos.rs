@@ -74,7 +74,6 @@ impl PlatformCapture {
         &self,
         tx: EventSender<CaptureEvent>,
         poll_focus_ms: u64,
-        _accessibility_poll_ms: u64,
         screenshot_on_focus_change: bool,
         screenshot_root: PathBuf,
     ) -> Result<()> {
@@ -88,8 +87,15 @@ impl PlatformCapture {
         let keyboard = std::thread::Builder::new()
             .name("capture-keyboard".into())
             .spawn(move || {
+                // A graceful Err (e.g. missing Input Monitoring grant) parks
+                // the thread instead of finishing it: D-14 keeps the daemon
+                // up degraded, while a real panic still finishes the thread
+                // and trips the daemon's D-06 death watch.
                 if let Err(err) = run_keyboard_loop(tx, paused_kb, exclude_kb) {
-                    warn!(?err, "keyboard capture stopped");
+                    warn!(?err, "keyboard capture unavailable; thread parked");
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
                 }
             })
             .map_err(|e| rustwatch_core::Error::Other(format!("spawn keyboard thread: {e}")))?;

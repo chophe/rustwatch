@@ -36,7 +36,6 @@ impl PlatformCapture {
         &self,
         _tx: std::sync::mpsc::Sender<CaptureEvent>,
         _poll_focus_ms: u64,
-        _accessibility_poll_ms: u64,
         _screenshot_on_focus_change: bool,
         _screenshot_root: PathBuf,
     ) -> Result<()> {

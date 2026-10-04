@@ -29,9 +29,29 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
+    // SYS-01 / T-01-05: lock FIRST, then write pid, then bind the socket.
+    // The advisory lock releases on any process death (crash included), so
+    // no stale-file dance can race a second instance. Never delete-then-bind.
+    ensure_parent(&paths.pid_file)?;
+    let pid_file_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&paths.pid_file)?;
+    if fs2::FileExt::try_lock_exclusive(&pid_file_lock).is_err() {
+        eprintln!(
+            "rustwatchd is already running (pid file locked: {})",
+            paths.pid_file.display()
+        );
+        std::process::exit(2);
+    }
+    std::fs::write(&paths.pid_file, std::process::id().to_string())?;
+
+    // Stale socket removal is safe only here: the lock above proves no other
+    // daemon is alive to race the bind below.
     ensure_parent(&paths.socket)?;
     if paths.socket.exists() {
-        let _ = std::fs::remove_file(&paths.socket);
+        std::fs::remove_file(&paths.socket).context("remove stale daemon socket")?;
     }
 
     let store = Store::open(&paths.sqlite)?;
@@ -55,7 +75,6 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     capture.start(
         event_tx,
         config.capture.poll_focus_ms,
-        config.capture.accessibility_poll_ms,
         config.capture.screenshot_on_focus_change,
         paths.screenshots.clone(),
     )?;
@@ -156,6 +175,14 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         .context("spawn writer thread")?;
 
     let listener = UnixListener::bind(&paths.socket).context("bind daemon socket")?;
+    // T-01-03: the socket streams full keystroke/screen history — owner-only
+    // after every bind (covers pre-existing sockets too).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))
+            .context("chmod 0600 daemon socket")?;
+    }
     info!(socket = %paths.socket.display(), "rustwatchd listening");
 
     let mut health_tick = tokio::time::interval(Duration::from_secs(1));

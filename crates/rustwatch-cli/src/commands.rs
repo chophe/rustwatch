@@ -36,9 +36,18 @@ pub fn install(_paths: &DataPaths) -> anyhow::Result<()> {
 }
 
 pub async fn start(paths: &DataPaths) -> anyhow::Result<()> {
-    if paths.pid_file.exists() {
-        println!("{}", "Daemon already appears to be running".yellow());
-        return Ok(());
+    // A answering socket is the liveness proof — cheaper and racier-free
+    // than trusting the pid file from here.
+    if paths.socket.exists() {
+        let client = DaemonClient::new(&paths.socket);
+        if let Ok(DaemonReply::Ok) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.send(DaemonCommand::Ping))
+                .await
+                .unwrap_or(Err(rustwatch_core::Error::DaemonNotRunning))
+        {
+            println!("{}", "Daemon already appears to be running".yellow());
+            return Ok(());
+        }
     }
 
     let exe = std::env::current_exe()?
@@ -47,15 +56,67 @@ pub async fn start(paths: &DataPaths) -> anyhow::Result<()> {
         .map(|p| p.join("rustwatchd"))
         .context("locate rustwatchd binary")?;
 
+    // Daemon stderr goes to a log file so a failed start can report its tail.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.root.join("rustwatchd.log"))
+        .context("open rustwatchd.log")?;
     Command::new(exe)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .spawn()
         .context("spawn rustwatchd")?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    println!("{}", style("rustwatchd started").green());
-    Ok(())
+    // Poll socket Ping with a deadline instead of a fixed sleep (Pitfall 4).
+    let client = DaemonClient::new(&paths.socket);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(DaemonReply::Ok) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.send(DaemonCommand::Ping))
+                .await
+                .unwrap_or(Err(rustwatch_core::Error::DaemonNotRunning))
+        {
+            println!("{}", style("rustwatchd started").green());
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            println!("{}", style("rustwatchd failed to start — log tail:").red());
+            print_log_tail(&paths.root.join("rustwatchd.log"), 20);
+            anyhow::bail!("rustwatchd did not answer Ping within 5 s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+fn print_log_tail(path: &std::path::Path, lines: usize) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        println!("  (no log file at {})", path.display());
+        return;
+    };
+    let all: Vec<&str> = raw.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    for line in &all[start..] {
+        println!("  {line}");
+    }
+}
+
+/// The short process name for a pid, via `ps`. `None` when it cannot be
+/// determined — callers treat that as unverified and refuse to signal.
+fn process_comm(pid: i32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .next()
+        .map(str::to_string)
 }
 
 pub fn stop(paths: &DataPaths) -> anyhow::Result<()> {
@@ -65,8 +126,45 @@ pub fn stop(paths: &DataPaths) -> anyhow::Result<()> {
     }
     let pid_raw = fs::read_to_string(&paths.pid_file)?;
     let pid: i32 = pid_raw.trim().parse().context("parse pid")?;
+
+    // T-01-02: never SIGTERM a pid we have not proven is ours. A stale pid
+    // file plus OS pid recycling otherwise kills an unrelated process.
+    // Probe 1: liveness.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if !alive {
+        println!("Stale pid file (no process {pid}); removing it");
+        fs::remove_file(&paths.pid_file)?;
+        if paths.socket.exists() {
+            fs::remove_file(&paths.socket)?;
+        }
+        return Ok(());
+    }
+    // Probe 2: process-name verify.
+    match process_comm(pid).as_deref() {
+        Some("rustwatchd") => {}
+        Some(other) => anyhow::bail!(
+            "pid {pid} is '{other}', not rustwatchd — refusing to signal. \
+             Remove {} manually if it is stale.",
+            paths.pid_file.display()
+        ),
+        None => anyhow::bail!(
+            "could not verify the process name for pid {pid} — refusing to signal. \
+             Remove {} manually if it is stale.",
+            paths.pid_file.display()
+        ),
+    }
+
     unsafe {
         libc::kill(pid, libc::SIGTERM);
+    }
+    // Poll for exit with a timeout before removing files: removing the
+    // socket while the daemon still drains would orphan its flush.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("daemon (pid {pid}) did not exit within 5 s; socket/pid files left in place");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let _ = fs::remove_file(&paths.pid_file);
     let _ = fs::remove_file(&paths.socket);
@@ -254,11 +352,7 @@ pub async fn memory_search(
     let mut table = Table::new();
     table.set_header(vec!["Score", "App", "Text"]);
     for hit in hits {
-        let snippet = if hit.text.len() > 120 {
-            format!("{}...", &hit.text[..120])
-        } else {
-            hit.text.clone()
-        };
+        let snippet = snippet_for(&hit.text);
         table.add_row(vec![
             Cell::new(format!("{:.3}", hit.score)),
             Cell::new(hit.app_name),
@@ -306,4 +400,34 @@ fn parse_opt_ts(raw: Option<String>) -> anyhow::Result<Option<DateTime<Utc>>> {
         Some(value) => Some(DateTime::parse_from_rfc3339(&value)?.with_timezone(&Utc)),
         None => None,
     })
+}
+
+/// CAPT-05: char-boundary truncation for search snippets — byte-slicing
+/// panics on CJK/emoji (same idiom as segment.rs).
+fn snippet_for(text: &str) -> String {
+    let snippet: String = text.chars().take(120).collect();
+    if text.chars().count() > 120 {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
+}
+
+#[cfg(test)]
+mod commands_tests {
+    use super::snippet_for;
+
+    /// CAPT-05: emoji/CJK floods never panic the snippet path.
+    #[test]
+    fn emoji_flood_snippet_is_char_safe() {
+        let flood = "🎉".repeat(500);
+        let snippet = snippet_for(&flood);
+        assert_eq!(snippet.chars().count(), 123); // 120 + "..."
+        assert!(snippet.ends_with("..."));
+    }
+
+    #[test]
+    fn short_cjk_text_passes_through() {
+        assert_eq!(snippet_for("日本語テスト"), "日本語テスト");
+    }
 }

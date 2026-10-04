@@ -238,8 +238,8 @@ impl Store {
                 process_id: row.get(3)?,
                 bundle_id: row.get(4)?,
                 text_buffer: row.get(5)?,
-                started_at: parse_ts(row.get(6)?),
-                ended_at: parse_ts(row.get(7)?),
+                started_at: parse_ts(row.get(6)?)?,
+                ended_at: parse_ts(row.get(7)?)?,
                 event_count: row.get(8)?,
             })
         })?;
@@ -263,8 +263,8 @@ impl Store {
                 process_id: row.get(3)?,
                 bundle_id: row.get(4)?,
                 text_buffer: row.get(5)?,
-                started_at: parse_ts(row.get(6)?),
-                ended_at: parse_ts(row.get(7)?),
+                started_at: parse_ts(row.get(6)?)?,
+                ended_at: parse_ts(row.get(7)?)?,
                 event_count: row.get(8)?,
             })
         })?;
@@ -284,8 +284,8 @@ impl Store {
                 label: row.get(1)?,
                 category: row.get(2)?,
                 confidence: row.get(3)?,
-                started_at: parse_ts(row.get(4)?),
-                ended_at: parse_ts(row.get(5)?),
+                started_at: parse_ts(row.get(4)?)?,
+                ended_at: parse_ts(row.get(5)?)?,
                 apps: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                 topics: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
                 segment_ids: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
@@ -307,8 +307,8 @@ impl Store {
                 process_id: row.get(3)?,
                 bundle_id: row.get(4)?,
                 text_buffer: row.get(5)?,
-                started_at: parse_ts(row.get(6)?),
-                ended_at: parse_ts(row.get(7)?),
+                started_at: parse_ts(row.get(6)?)?,
+                ended_at: parse_ts(row.get(7)?)?,
                 event_count: row.get(8)?,
             })
         })
@@ -341,10 +341,12 @@ impl Store {
     }
 }
 
-fn parse_ts(raw: String) -> DateTime<Utc> {
+/// Corrupt timestamps error like `map_event_row` does instead of
+/// substituting `Utc::now()`, which would silently corrupt the time series.
+fn parse_ts(raw: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&raw)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
 }
 
 fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureEvent> {
@@ -449,5 +451,25 @@ mod retry_queue_tests {
         assert_eq!(queue.take_dropped(), 0);
         queue.clear();
         assert!(queue.is_empty());
+    }
+
+    /// Corrupt timestamps error instead of becoming `now()`: the time
+    /// series must never be silently rewritten.
+    #[test]
+    fn corrupt_timestamp_errors_instead_of_now() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustwatch-corrupt-ts-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("test.db")).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO events (id, timestamp, app_json, payload_json) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["bad-row", "not-a-timestamp", None::<String>, "{}"],
+            )
+            .unwrap();
+        assert!(store.list_events_since(None, 10).is_err());
     }
 }
