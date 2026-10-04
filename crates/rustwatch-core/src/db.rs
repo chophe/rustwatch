@@ -9,6 +9,85 @@ use crate::{
 
 embed_migrations!("migrations");
 
+/// D-04: capacity of the in-memory retry queue. Bounded (never unbounded),
+/// overflow drops oldest and counts it — never silent.
+pub const RETRY_QUEUE_CAP: usize = 10_000;
+
+/// D-04: retry only SQLITE_BUSY / IO failures. Everything else (constraint,
+/// schema drift, serialization) is poison — log + count immediately, never
+/// loop. Classified by error kind, never by string matching.
+pub fn is_retryable_db_error(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(code, _) => matches!(
+            code.code,
+            rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::SystemIoFailure
+        ),
+        _ => false,
+    }
+}
+
+/// D-04 classification over the store's error type. `Io` (e.g. disk hiccup
+/// under WAL) is retryable; all other non-DB failures are fatal.
+pub fn is_retryable_store_error(err: &crate::Error) -> bool {
+    match err {
+        crate::Error::Db(inner) => is_retryable_db_error(inner),
+        crate::Error::Io(_) => true,
+        _ => false,
+    }
+}
+
+/// D-03/D-04: bounded in-memory retry queue owned by the writer task.
+/// Overflow drops the oldest event and counts it in `dropped`.
+pub struct RetryQueue {
+    inner: std::collections::VecDeque<CaptureEvent>,
+    cap: usize,
+    dropped: u64,
+}
+
+impl RetryQueue {
+    pub fn new() -> Self {
+        Self::with_cap(RETRY_QUEUE_CAP)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            inner: std::collections::VecDeque::new(),
+            cap,
+            dropped: 0,
+        }
+    }
+
+    pub fn push(&mut self, event: CaptureEvent) {
+        if self.inner.len() >= self.cap {
+            self.inner.pop_front();
+            self.dropped += 1;
+        }
+        self.inner.push_back(event);
+    }
+
+    pub fn pop_front(&mut self) -> Option<CaptureEvent> {
+        self.inner.pop_front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+impl Default for RetryQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Store {
     conn: Connection,
 }
