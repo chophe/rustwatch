@@ -1,17 +1,18 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
-use rustwatch_capture::{CaptureHandle, PlatformCapture};
+use rustwatch_capture::{CaptureHandle, KeyboardLaunch, PlatformCapture};
 use rustwatch_core::{
     is_retryable_store_error,
-    paths::{ensure_parent, load_or_create_config},
+    paths::{ensure_parent, load_or_create_config, save_permissions_prompted},
+    classify_grant, diff_permissions, grants_to_request, paths_live,
     CaptureEvent, CaptureEventKind, Config, DataPaths, DaemonCommand, DaemonReply, DaemonState,
-    RetryQueue, SegmentGrouper, Store,
+    Grant, GrantTransition, PermissionState, PermissionsState, RetryQueue, SegmentGrouper, Store,
 };
 use tokio::net::UnixListener;
 use tokio::time::MissedTickBehavior;
@@ -29,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     run_daemon(paths, config).await
 }
 
-async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
+async fn run_daemon(paths: DataPaths, mut config: Config) -> anyhow::Result<()> {
     // SYS-01 / T-01-05: lock FIRST, then write pid, then bind the socket.
     // The advisory lock releases on any process death (crash included), so
     // no stale-file dance can race a second instance. Never delete-then-bind.
@@ -56,15 +57,34 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     }
 
     let store = Store::open(&paths.sqlite)?;
-    // 01-03 tracer: real TCC probe results live in daemon state from
-    // startup, so `status`/TUI/doctor render truth instead of hardcoded
-    // booleans. The 30 s re-probe refresh (task 2) mutates this snapshot.
-    let daemon_permissions = CaptureHandle::permissions_with_prompted(&config.permissions);
-    let permissions_snapshot = rustwatch_core::PermissionsState {
-        input_monitoring: daemon_permissions.input_monitoring,
-        accessibility: daemon_permissions.accessibility,
-        screen_recording: daemon_permissions.screen_recording,
-    };
+    // 01-03: real TCC probe results live in daemon state from startup, so
+    // `status`/TUI/doctor render truth instead of hardcoded booleans. The
+    // preflight runs AFTER the single-instance lock: only the real daemon
+    // ever triggers a native dialog. D-13: request ONLY undetermined grants
+    // exactly once; denials log their Settings pane + URL, never re-prompt.
+    let initial = run_permission_preflight(&mut config, &paths.config);
+    let liveness = paths_live(&initial);
+    if !liveness.keyboard {
+        info!("keyboard capture disabled at startup (input monitoring not granted); titles/screenshots continue");
+    }
+    if !liveness.screenshots {
+        info!("screenshot triggers disabled at startup (screen recording not granted); app/title capture continues");
+    }
+    // Shared permission truth: the re-probe task refreshes it every ~30 s,
+    // the Status handler renders it. `notice` carries transition messages
+    // (restart-required, detached); the keyboard thread owns `keyboard_note`
+    // separately so neither writer clobbers the other.
+    let snapshot = Arc::new(Mutex::new(PermissionSnapshot {
+        state: initial,
+        notice: String::new(),
+        screen_restart_pending: false,
+    }));
+    let snapshot_ipc = Arc::clone(&snapshot);
+    let snapshot_reprobe = Arc::clone(&snapshot);
+    let keyboard_note = Arc::new(Mutex::new(String::new()));
+    let keyboard_note_ipc = Arc::clone(&keyboard_note);
+    let screenshots_live = Arc::new(AtomicBool::new(liveness.screenshots));
+    let scheduler_screenshots_live = Arc::clone(&screenshots_live);
     let paused = Arc::new(AtomicBool::new(false));
     let counters = WriterCounters::new();
     let events_captured = Arc::clone(&counters.events);
@@ -100,6 +120,9 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         config.capture.hotkey_chord.clone(),
         focus_idle,
         paths.screenshots.clone(),
+        liveness.keyboard,
+        Arc::clone(&screenshots_live),
+        Arc::clone(&keyboard_note),
     )?;
 
     // D-05: SIGTERM/SIGINT stops capture, then the writer drains with a
@@ -200,6 +223,24 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         })
         .context("spawn writer thread")?;
 
+    // D-15: cached keyboard launch for a late Input Monitoring HotAttach.
+    let reprobe = ReprobeHandle {
+        snapshot: snapshot_reprobe,
+        screenshots_live: Arc::clone(&screenshots_live),
+        capture: capture.clone(),
+        keyboard_launch: KeyboardLaunch {
+            tx: scheduler_tx.clone(),
+            exclude_apps: config.capture.exclude_apps.clone(),
+            hotkey_enabled: config.capture.hotkey_enabled,
+            hotkey_chord: config.capture.hotkey_chord.clone(),
+            screenshot_root: paths.screenshots.clone(),
+            paused: Arc::clone(&paused),
+            screenshots_live: Arc::clone(&screenshots_live),
+            keyboard_note: Arc::clone(&keyboard_note),
+        },
+        prompted: config.permissions,
+    };
+
     // CAPT-02/D-17: the scheduler owns the interval tick AND the ~5 s
     // idle poll. It always runs — a 0 interval disables interval shots but
     // idle detection must keep working.
@@ -214,6 +255,8 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         config.capture.idle_start_secs,
         config.capture.idle_end_sustained_secs,
         scheduler_idle,
+        scheduler_screenshots_live,
+        reprobe,
     ));
 
     let listener = UnixListener::bind(&paths.socket).context("bind daemon socket")?;
@@ -262,7 +305,8 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
         let dropped_ref = Arc::clone(&dropped_events);
         let queued_ref = Arc::clone(&queued);
         let started = started_at.clone();
-        let permissions_state = permissions_snapshot;
+        let snapshot_ref = Arc::clone(&snapshot_ipc);
+        let keyboard_note_ref = Arc::clone(&keyboard_note_ipc);
         let capture_ref = paths.screenshots.clone();
         let capture_handle = capture_for_ipc.clone();
         let sqlite_path = paths.sqlite.clone();
@@ -287,6 +331,22 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                         let write_errors = errors_ref.load(Ordering::Relaxed);
                         let dropped_events = dropped_ref.load(Ordering::Relaxed);
                         let queued = queued_ref.load(Ordering::Relaxed);
+                        // Permission truth + visible path notes: a dead path
+                        // is a daemon-state fact (D-14), never a lone log.
+                        let (permissions, capture_note) = {
+                            let snap =
+                                snapshot_ref.lock().unwrap_or_else(|e| e.into_inner());
+                            let kb =
+                                keyboard_note_ref.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut parts = Vec::new();
+                            if !snap.notice.is_empty() {
+                                parts.push(snap.notice.clone());
+                            }
+                            if !kb.is_empty() {
+                                parts.push(kb.clone());
+                            }
+                            (snap.state, parts.join(" | "))
+                        };
                         DaemonReply::Status {
                             state: DaemonState {
                                 running: true,
@@ -303,7 +363,8 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
                                     dropped_events,
                                     queued,
                                 ),
-                                permissions: permissions_state,
+                                permissions,
+                                capture_note,
                             },
                         }
                     }
@@ -372,6 +433,185 @@ async fn run_daemon(paths: DataPaths, config: Config) -> anyhow::Result<()> {
     // drops (a detached send failure is harmless — the writer is gone).
     let _ = scheduler_handle.await;
     Ok(())
+}
+
+/// D-13 shared permission truth: the preflight sets the initial state, the
+/// 30 s re-probe task refreshes it, the Status handler renders it.
+/// `notice` carries transition messages (restart-required, detached paths).
+/// The keyboard thread owns a SEPARATE `keyboard_note` string so neither
+/// writer clobbers the other — Status joins both into `capture_note`.
+struct PermissionSnapshot {
+    state: PermissionsState,
+    notice: String,
+    /// Screen Recording granted mid-run: macOS demands a process restart
+    /// before screenshots resume, so the flag stays latched (and
+    /// `screenshots_live` stays false) until the next launch.
+    screen_restart_pending: bool,
+}
+
+/// D-15: everything the 30 s re-probe cycle needs, cached at startup.
+/// Moved into the scheduler task; `run_cycle` is check-only plus attach.
+struct ReprobeHandle {
+    snapshot: Arc<Mutex<PermissionSnapshot>>,
+    screenshots_live: Arc<AtomicBool>,
+    capture: CaptureHandle,
+    keyboard_launch: KeyboardLaunch,
+    prompted: rustwatch_core::PermissionsConfig,
+}
+
+/// D-15 re-probe cadence: cheap check-only probes, never prompts.
+const REPROBE_SECS: u64 = 30;
+
+/// D-13 first-run preflight: CHECK all three grants, REQUEST only the
+/// undetermined-never-prompted ones exactly once (native dialogs), then
+/// persist the prompted flags so the 30 s loop only CHECKS (Pitfall 6).
+/// Previously-denied grants log their System Settings pane + URL and are
+/// never re-prompted. Runs AFTER the single-instance lock: only the real
+/// daemon ever triggers a native dialog.
+fn run_permission_preflight(
+    config: &mut Config,
+    config_path: &std::path::Path,
+) -> PermissionsState {
+    let (input, ax, screen) = CaptureHandle::probe_all_check_only();
+    let mut state = PermissionsState {
+        input_monitoring: classify_grant(input, config.permissions.prompted_input_monitoring),
+        accessibility: classify_grant(ax, config.permissions.prompted_accessibility),
+        screen_recording: classify_grant(screen, config.permissions.prompted_screen_recording),
+    };
+    let mut requested_any = false;
+    for grant in grants_to_request(&state, &config.permissions) {
+        let granted_after = CaptureHandle::request_grant(grant);
+        match grant {
+            Grant::InputMonitoring => config.permissions.prompted_input_monitoring = true,
+            Grant::Accessibility => config.permissions.prompted_accessibility = true,
+            Grant::ScreenRecording => config.permissions.prompted_screen_recording = true,
+        }
+        requested_any = true;
+        if granted_after {
+            match grant {
+                Grant::InputMonitoring => state.input_monitoring = PermissionState::Granted,
+                Grant::Accessibility => state.accessibility = PermissionState::Granted,
+                Grant::ScreenRecording => state.screen_recording = PermissionState::Granted,
+            }
+            info!(grant = grant.name(), "permission granted after prompt");
+        } else {
+            info!(
+                grant = grant.name(),
+                url = grant.settings_url(),
+                "permission not granted; open System Settings instead of re-prompting"
+            );
+        }
+    }
+    if requested_any {
+        if let Err(err) = save_permissions_prompted(config_path, &config.permissions) {
+            error!(?err, "preflight: could not persist prompted flags; may re-prompt next launch");
+        }
+    }
+    state
+}
+
+impl ReprobeHandle {
+    /// One D-15 check-only cycle: re-probe, diff against the snapshot, and
+    /// act on transitions. Hot-attaches the keyboard thread where the API
+    /// permits, latches restart-required for Screen Recording, stops
+    /// screenshot paths whose grants vanished. Never prompts.
+    fn run_cycle(&self) {
+        let (input, ax, screen) = CaptureHandle::probe_all_check_only();
+        let fresh = PermissionsState {
+            input_monitoring: classify_grant(input, self.prompted.prompted_input_monitoring),
+            accessibility: classify_grant(ax, self.prompted.prompted_accessibility),
+            screen_recording: classify_grant(screen, self.prompted.prompted_screen_recording),
+        };
+        let transitions = diff_permissions(
+            &self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).state,
+            &fresh,
+        );
+        if transitions.is_empty() {
+            return;
+        }
+        let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snap.state = fresh;
+        let mut notices = Vec::new();
+        if snap.screen_restart_pending {
+            notices.push(
+                "screen recording granted earlier — restart rustwatchd to enable screenshots"
+                    .to_string(),
+            );
+        }
+        for transition in transitions {
+            match transition {
+                GrantTransition::HotAttach(Grant::InputMonitoring) => {
+                    match self.capture.start_keyboard(self.keyboard_launch.clone()) {
+                        Ok(true) => {
+                            info!("input monitoring granted: keyboard capture attached live");
+                            notices.push(
+                                "keyboard capture attached (input monitoring granted)".to_string(),
+                            );
+                        }
+                        Ok(false) => {
+                            info!("input monitoring granted: keyboard thread already running");
+                        }
+                        Err(err) => {
+                            error!(?err, "re-probe: keyboard HotAttach failed; will retry next cycle");
+                        }
+                    }
+                }
+                GrantTransition::HotAttach(grant) => {
+                    info!(grant = grant.name(), "permission granted: path re-attached live");
+                    notices.push(format!("{} granted — path live", grant.name()));
+                }
+                GrantTransition::RestartRequired(grant) => {
+                    // Only Screen Recording routes here (see
+                    // `Grant::restart_required_on_attach`).
+                    snap.screen_restart_pending = true;
+                    self.screenshots_live.store(false, Ordering::SeqCst);
+                    error!(
+                        grant = grant.name(),
+                        "permission granted but macOS requires a process restart; screenshots stay off until rustwatchd restarts"
+                    );
+                    notices.push(format!(
+                        "{} granted — restart rustwatchd to enable screenshots",
+                        grant.name()
+                    ));
+                }
+                GrantTransition::Detached(grant) => {
+                    match grant {
+                        Grant::InputMonitoring => {
+                            // The thread cannot be un-spawned: its next tap
+                            // read fails and the park-retry loop records a
+                            // visible note by itself. State the fact here.
+                            error!("input monitoring revoked: keyboard capture stopped; re-grant to resume");
+                            notices.push(
+                                "input monitoring revoked — keyboard capture stopped".to_string(),
+                            );
+                        }
+                        Grant::ScreenRecording => {
+                            self.screenshots_live.store(false, Ordering::SeqCst);
+                            error!("screen recording revoked: screenshot triggers stopped; app/title capture continues");
+                            notices.push(
+                                "screen recording revoked — screenshots stopped".to_string(),
+                            );
+                        }
+                        Grant::Accessibility => {
+                            info!("accessibility revoked: window-title quality may degrade");
+                            notices.push(
+                                "accessibility revoked — title quality may degrade".to_string(),
+                            );
+                        }
+                    }
+                }
+                GrantTransition::None => {}
+            }
+        }
+        // Recompute the screenshot gate from live truth: granted AND no
+        // pending restart. (A revoked-then-re-granted Screen Recording stays
+        // off until restart via the latch above.)
+        let live = paths_live(&fresh);
+        if live.screenshots && !snap.screen_restart_pending {
+            self.screenshots_live.store(true, Ordering::SeqCst);
+        }
+        snap.notice = notices.join(" | ");
+    }
 }
 
 /// Shared loss counters behind the writer thread and the IPC status path.
@@ -499,6 +739,9 @@ fn poll_idle(
 ///
 /// D-17/D-19: the same task polls hardware idle every ~5 s and injects
 /// synthetic `IdleStart`/`ActivityResumed` signals on the same channel.
+///
+/// D-15: the same task re-probes permission grants every ~30 s (check-only,
+/// never prompts) and hot-attaches/detaches paths via `reprobe`.
 async fn run_screenshot_scheduler(
     capture: CaptureHandle,
     tx: std::sync::mpsc::Sender<CaptureEvent>,
@@ -510,6 +753,8 @@ async fn run_screenshot_scheduler(
     idle_start_secs: u64,
     idle_end_sustained_secs: u64,
     idle_flag: Arc<AtomicBool>,
+    screenshots_live: Arc<AtomicBool>,
+    reprobe: ReprobeHandle,
 ) {
     let mut ticker = period.map(|p| {
         let mut t = tokio::time::interval(p);
@@ -522,6 +767,7 @@ async fn run_screenshot_scheduler(
         t.tick().await;
     }
     let mut idle_ticker = tokio::time::interval(Duration::from_secs(IDLE_POLL_SECS));
+    let mut reprobe_ticker = tokio::time::interval(Duration::from_secs(REPROBE_SECS));
     let mut idle_state = IdleState::default();
     let mut last_tick = Instant::now();
     loop {
@@ -529,6 +775,15 @@ async fn run_screenshot_scheduler(
             _ = shutdown.notified() => {
                 info!("scheduler shutting down");
                 break;
+            }
+            // D-15: check-only re-probe. Hot-attaches granted paths where
+            // the API permits, stops paths whose grants vanished, and says
+            // restart-required where macOS demands it. Never prompts.
+            _ = reprobe_ticker.tick() => {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                reprobe.run_cycle();
             }
             // A disabled (0) interval parks this arm forever; idle still polls.
             _ = async {
@@ -544,6 +799,11 @@ async fn run_screenshot_scheduler(
                 // D-20: interval shots pause during idle (the hotkey stays
                 // live). Cadence restarts fresh at idle end via reset().
                 if idle_flag.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // D-14: a revoked Screen Recording grant skips interval
+                // shots while app/title capture continues.
+                if !screenshots_live.load(Ordering::SeqCst) {
                     continue;
                 }
                 // The Notify is lossy: a SIGTERM landing mid-capture misses

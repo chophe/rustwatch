@@ -101,7 +101,7 @@ impl Default for PrivacyConfig {
 
 /// D-13 request-once bookkeeping, consumed by the 01-03 preflight: the 30 s
 /// re-probe loop only *checks*, and only requests grants never prompted.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PermissionsConfig {
     pub prompted_input_monitoring: bool,

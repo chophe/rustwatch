@@ -101,6 +101,77 @@ pub fn load_or_create_config(path: &Path) -> anyhow::Result<crate::Config> {
     Ok(config)
 }
 
+/// Persist only the `[permissions] prompted_*` flags (01-03 preflight),
+/// MERGED into the existing file through `toml::Value` — a full-struct
+/// rewrite would drop unknown/future keys and break the SYS-01
+/// forward-compat promise (old `[data]`/`[ui]` remnants, future knobs).
+pub fn save_permissions_prompted(
+    path: &Path,
+    prompted: &crate::PermissionsConfig,
+) -> anyhow::Result<()> {
+    let mut value: toml::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)?;
+        toml::from_str(&raw)?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = value
+        .as_table_mut()
+        .context("config root must be a table")?;
+    let perms = table
+        .entry("permissions")
+        .or_insert(toml::Value::Table(toml::map::Map::new()));
+    let perms_table = perms.as_table_mut().context("[permissions] must be a table")?;
+    perms_table.insert(
+        "prompted_input_monitoring".into(),
+        toml::Value::Boolean(prompted.prompted_input_monitoring),
+    );
+    perms_table.insert(
+        "prompted_accessibility".into(),
+        toml::Value::Boolean(prompted.prompted_accessibility),
+    );
+    perms_table.insert(
+        "prompted_screen_recording".into(),
+        toml::Value::Boolean(prompted.prompted_screen_recording),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod paths_tests {
+    /// Prompt persistence merges: unknown sections/keys survive the write.
+    #[test]
+    fn prompted_save_preserves_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustwatch-prompted-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[capture]\npoll_focus_ms = 500\n\n[data]\ndir = \"x\"\n\n[future]\nkey = 1\n",
+        )
+        .unwrap();
+        let prompted = crate::PermissionsConfig {
+            prompted_input_monitoring: true,
+            ..Default::default()
+        };
+        super::save_permissions_prompted(&path, &prompted).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[data]"), "unknown section dropped: {raw}");
+        assert!(raw.contains("[future]"), "future section dropped: {raw}");
+        let config: crate::Config = toml::from_str(&raw).unwrap();
+        assert!(config.permissions.prompted_input_monitoring);
+        assert!(!config.permissions.prompted_screen_recording);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// SYS-01: every `config.toml` section/key not in the schema. Unknown keys
 /// warn at startup instead of failing or being silently ignored, so removed
 /// fields ([data], [ui], …) and future keys never brick startup.

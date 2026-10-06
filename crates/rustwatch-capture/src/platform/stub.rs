@@ -48,10 +48,30 @@ impl PlatformCapture {
         _hotkey_chord: String,
         _idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _screenshot_root: PathBuf,
+        _keyboard_enabled: bool,
+        _screenshots_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _keyboard_note: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> Result<()> {
         Err(rustwatch_core::Error::UnsupportedPlatform(
             "capture is only implemented for macOS in v0.1".into(),
         ))
+    }
+
+    pub fn start_keyboard(
+        &self,
+        _launch: crate::KeyboardLaunch,
+    ) -> Result<bool> {
+        Err(rustwatch_core::Error::UnsupportedPlatform(
+            "capture is only implemented for macOS in v0.1".into(),
+        ))
+    }
+
+    pub fn probe_all_check_only() -> (bool, bool, bool) {
+        (false, false, false)
+    }
+
+    pub fn request_grant(_grant: rustwatch_core::Grant) -> bool {
+        false
     }
 
     pub fn capture_screenshot(

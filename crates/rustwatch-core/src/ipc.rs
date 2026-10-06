@@ -28,6 +28,10 @@ pub struct DaemonState {
     /// `#[serde(default)]` keeps older daemon replies parseable.
     #[serde(default)]
     pub permissions: crate::PermissionsState,
+    /// Visible capture-path note (parked keyboard reason, restart-required):
+    /// a dead path is a daemon-state fact, never a lone log warning.
+    #[serde(default)]
+    pub capture_note: String,
 }
 
 impl DaemonState {

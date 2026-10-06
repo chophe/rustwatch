@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::path::PathBuf;use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -8,7 +9,8 @@ use std::time::{Duration, Instant};
 use rustwatch_core::{
     classify_grant,
     events::{AppContext, CaptureEvent, CaptureEventKind, ScreenshotScope},
-    is_excluded, key_to_text, LogicalKey, Modifiers, PermissionsConfig, PermissionState, Result,
+    is_excluded, key_to_text, Grant, LogicalKey, Modifiers, PermissionsConfig, PermissionState,
+    Result,
 };
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -29,6 +31,9 @@ pub struct PlatformCapture {
     /// D-06: join handles for the capture threads. The daemon watches them
     /// and exits nonzero if any dies, so launchd KeepAlive restarts it.
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// D-14 attach guard: the keyboard thread spawns at most once per
+    /// process (startup spawn or one HotAttach), never duplicated.
+    keyboard_started: Arc<AtomicBool>,
 }
 
 impl Clone for PlatformCapture {
@@ -37,6 +42,7 @@ impl Clone for PlatformCapture {
             exclude_apps: self.exclude_apps.clone(),
             paused: Arc::clone(&self.paused),
             threads: Arc::clone(&self.threads),
+            keyboard_started: Arc::clone(&self.keyboard_started),
         }
     }
 }
@@ -47,6 +53,7 @@ impl PlatformCapture {
             exclude_apps,
             paused: Arc::new(AtomicBool::new(false)),
             threads: Arc::new(Mutex::new(Vec::new())),
+            keyboard_started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -64,13 +71,39 @@ impl PlatformCapture {
         Self::permissions_with_prompted(&PermissionsConfig::default())
     }
 
-    /// Real Screen Recording probe end-to-end (01-03 tracer); Input
-    /// Monitoring and Accessibility stay undetermined until task 2 wires
-    /// their probes. `prompted` is the daemon's `[permissions] prompted_*`
+    /// Full three-grant report. `prompted` is the `[permissions] prompted_*`
     /// bookkeeping: a `false` probe with no prior prompt is undetermined,
     /// with a prior prompt is denied (see `classify_grant`).
     pub fn permissions_with_prompted(prompted: &PermissionsConfig) -> PermissionsReport {
-        build_report(probe_screen_recording(), prompted)
+        let (input, accessibility, screen) = Self::probe_all_check_only();
+        build_report(input, accessibility, screen, prompted)
+    }
+
+    /// D-15 check-only trio for the 30 s re-probe loop and `status`/`doctor`.
+    /// NEVER prompts: Screen Recording uses the Preflight (check) variant,
+    /// Accessibility uses `AXIsProcessTrusted` (check), and the Input
+    /// Monitoring tap attempt is prompt-free once `prompted_*` is set — the
+    /// preflight performs the single request before any of these run
+    /// repeatedly (Pitfall 6).
+    pub fn probe_all_check_only() -> (bool, bool, bool) {
+        (
+            probe_input_monitoring(),
+            probe_accessibility(),
+            probe_screen_recording(),
+        )
+    }
+
+    /// D-13 first-run request: the REQUEST variant per grant, called at most
+    /// once per undetermined grant (gated by `wants_prompt` + persisted
+    /// flags). Returns the post-request probe state.
+    pub fn request_grant(grant: Grant) -> bool {
+        match grant {
+            // No request API exists: the tap attempt IS the request — the
+            // system prompts on first listen when undetermined.
+            Grant::InputMonitoring => probe_input_monitoring(),
+            Grant::Accessibility => request_accessibility(),
+            Grant::ScreenRecording => request_screen_recording(),
+        }
     }
 
     pub fn start(
@@ -83,46 +116,38 @@ impl PlatformCapture {
         hotkey_chord: String,
         idle: Arc<AtomicBool>,
         screenshot_root: PathBuf,
+        keyboard_enabled: bool,
+        screenshots_live: Arc<AtomicBool>,
+        keyboard_note: Arc<Mutex<String>>,
     ) -> Result<()> {
         let exclude = self.exclude_apps.clone();
-        let paused_kb = Arc::clone(&self.paused);
         let paused_focus = Arc::clone(&self.paused);
 
-        // Parse once at startup: an unparsable chord disables the hotkey
-        // loudly instead of failing every keypress.
-        let hotkey = if hotkey_enabled {
-            match parse_hotkey(&hotkey_chord) {
-                Some(chord) => Some(chord),
-                None => {
-                    warn!(chord = %hotkey_chord, "ignoring unparsable hotkey_chord; hotkey disabled");
-                    None
-                }
-            }
+        if keyboard_enabled {
+            // D-14: no Input Monitoring means this never spawns (titles and
+            // screenshots continue). A tap failure AFTER a granted probe
+            // parks inside the thread with a visible note, never a lone
+            // warning — and the daemon stays up.
+            let launch = crate::KeyboardLaunch {
+                tx: tx.clone(),
+                exclude_apps: exclude.clone(),
+                hotkey_enabled,
+                hotkey_chord: hotkey_chord.clone(),
+                screenshot_root: screenshot_root.clone(),
+                paused: Arc::clone(&self.paused),
+                screenshots_live: Arc::clone(&screenshots_live),
+                keyboard_note: Arc::clone(&keyboard_note),
+            };
+            // Fresh handle: the guard is always free here; a HotAttach later
+            // is the only other spawner.
+            let _ = self.start_keyboard(launch)?;
         } else {
-            None
-        };
+            *keyboard_note.lock().unwrap_or_else(|e| e.into_inner()) =
+                "keyboard capture disabled: input monitoring not granted".to_string();
+        }
 
-        let exclude_kb = exclude.clone();
         let tx_focus = tx.clone();
         let threads = Arc::clone(&self.threads);
-        let kb_root = screenshot_root.clone();
-        let keyboard = std::thread::Builder::new()
-            .name("capture-keyboard".into())
-            .spawn(move || {
-                // A graceful Err (e.g. missing Input Monitoring grant) parks
-                // the thread instead of finishing it: D-14 keeps the daemon
-                // up degraded, while a real panic still finishes the thread
-                // and trips the daemon's D-06 death watch.
-                if let Err(err) = run_keyboard_loop(tx, paused_kb, exclude_kb, hotkey, kb_root)
-                {
-                    warn!(?err, "keyboard capture unavailable; thread parked");
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(3600));
-                    }
-                }
-            })
-            .map_err(|e| rustwatch_core::Error::Other(format!("spawn keyboard thread: {e}")))?;
-
         let focus = std::thread::Builder::new()
             .name("capture-focus".into())
             .spawn(move || {
@@ -135,6 +160,7 @@ impl PlatformCapture {
                     screenshot_root,
                     exclude,
                     paused_focus,
+                    screenshots_live,
                 ) {
                     warn!(?err, "focus capture stopped");
                 }
@@ -144,9 +170,80 @@ impl PlatformCapture {
         threads
             .lock()
             .map_err(|_| rustwatch_core::Error::Other("capture thread registry poisoned".into()))?
-            .extend([keyboard, focus]);
+            .extend([focus]);
 
         Ok(())
+    }
+
+    /// D-15 HotAttach: spawn the keyboard thread after a late grant. Guard
+    /// makes it at-most-once per process — `Ok(false)` when already running.
+    pub fn start_keyboard(&self, launch: crate::KeyboardLaunch) -> Result<bool> {
+        if self
+            .keyboard_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        // Parse once: an unparsable chord disables the hotkey loudly
+        // instead of failing every keypress.
+        let hotkey = if launch.hotkey_enabled {
+            match parse_hotkey(&launch.hotkey_chord) {
+                Some(chord) => Some(chord),
+                None => {
+                    warn!(chord = %launch.hotkey_chord, "ignoring unparsable hotkey_chord; hotkey disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let threads = Arc::clone(&self.threads);
+        let keyboard = std::thread::Builder::new()
+            .name("capture-keyboard".into())
+            .spawn(move || {
+                // D-14 park-retry: a graceful Err (grant flapped between
+                // probe and tap) parks 30 s and retries with a visible note
+                // instead of finishing the thread. A real panic still
+                // finishes it and trips the daemon's D-06 death watch.
+                loop {
+                    let outcome = run_keyboard_loop(
+                        &launch.tx,
+                        &launch.paused,
+                        &launch.exclude_apps,
+                        hotkey.as_ref(),
+                        &launch.screenshot_root,
+                        &launch.screenshots_live,
+                        &launch.keyboard_note,
+                    );
+                    match outcome {
+                        Ok(()) => {
+                            tracing::error!("keyboard tap stream ended unexpectedly; retrying parked");
+                            set_keyboard_note(
+                                &launch.keyboard_note,
+                                "keyboard capture stream ended; retrying",
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "keyboard capture unavailable; thread parked");
+                            set_keyboard_note(
+                                &launch.keyboard_note,
+                                &format!("keyboard capture unavailable: {err}"),
+                            );
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
+            })
+            .map_err(|e| rustwatch_core::Error::Other(format!("spawn keyboard thread: {e}")))?;
+
+        threads
+            .lock()
+            .map_err(|_| rustwatch_core::Error::Other("capture thread registry poisoned".into()))?
+            .push(keyboard);
+
+        Ok(true)
     }
 
     pub fn capture_screenshot(
@@ -200,6 +297,34 @@ impl PlatformCapture {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> u8;
+    /// REQUEST variant: prompts when undetermined. Preflight-only callers
+    /// never touch this — it fires at most once per grant (D-13).
+    fn CGRequestScreenCaptureAccess() -> u8;
+}
+
+// COMPILE-TIME verification (01-03 task 2): ApplicationServices has no
+// usable Rust binding in the tree, so the Accessibility probe declares its
+// own 10-line fallback. `AXIsProcessTrusted` is the CHECK variant (never
+// prompts); `...WithOptions` with the prompt key is the REQUEST variant.
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> u8;
+    static kAXTrustedCheckOptionPrompt: *const c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFBooleanTrue: *const c_void;
+    fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        num_values: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
 }
 
 /// Raw Screen Recording grant probe: true = granted. False folds
@@ -210,16 +335,69 @@ fn probe_screen_recording() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() != 0 }
 }
 
-/// Pure report assembly over an INJECTED probe result, so the mapping is
+/// REQUEST variant: shows the native Screen Recording dialog when
+/// undetermined, then reports the outcome. At-most-once per D-13.
+fn request_screen_recording() -> bool {
+    // SAFETY: pure Quartz request; no arguments, no out-pointers.
+    unsafe { CGRequestScreenCaptureAccess() != 0 }
+}
+
+/// Accessibility CHECK: `AXIsProcessTrusted` answers without prompting.
+fn probe_accessibility() -> bool {
+    // SAFETY: pure getter; no arguments.
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// Accessibility REQUEST: shows the native dialog once when undetermined
+/// via the `{prompt: true}` options dict, then reports the outcome.
+fn request_accessibility() -> bool {
+    // SAFETY: synchronous call with global key/value pointers that outlive
+    // it, so NULL retain/release callbacks are sound; the dict is released
+    // before return on the success path.
+    unsafe {
+        let key = kAXTrustedCheckOptionPrompt;
+        let value = kCFBooleanTrue;
+        let dict = CFDictionaryCreate(
+            std::ptr::null(),
+            &key,
+            &value,
+            1,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        if dict.is_null() {
+            return probe_accessibility();
+        }
+        let trusted = AXIsProcessTrustedWithOptions(dict) != 0;
+        CFRelease(dict);
+        trusted
+    }
+}
+
+/// Input Monitoring probe: NO public TCC API exists, so attempting tap
+/// creation is the standard probe — a failed `Tap::new` with no other error
+/// means denied (RESEARCH.md). The attempt doubles as the REQUEST: the
+/// system prompts on first listen when undetermined, which is why the
+/// re-probe loop only attempts after `prompted_*` is set (Pitfall 6).
+fn probe_input_monitoring() -> bool {
+    keytap::Tap::new().is_ok()
+}
+
+/// Pure report assembly over INJECTED probe results, so the mapping is
 /// unit-testable without touching TCC. The live path calls this with the
-/// real `probe_screen_recording()` value.
-fn build_report(screen_granted: bool, prompted: &PermissionsConfig) -> PermissionsReport {
+/// real `probe_all_check_only()` values.
+fn build_report(
+    input_granted: bool,
+    accessibility_granted: bool,
+    screen_granted: bool,
+    prompted: &PermissionsConfig,
+) -> PermissionsReport {
     let mut notes = Vec::new();
     notes.push("Grant Input Monitoring, Accessibility, and Screen Recording in System Settings.".into());
     notes.push("After granting Screen Recording, restart rustwatchd.".into());
     PermissionsReport {
-        input_monitoring: PermissionState::Undetermined,
-        accessibility: PermissionState::Undetermined,
+        input_monitoring: classify_grant(input_granted, prompted.prompted_input_monitoring),
+        accessibility: classify_grant(accessibility_granted, prompted.prompted_accessibility),
         screen_recording: classify_grant(screen_granted, prompted.prompted_screen_recording),
         notes,
     }
@@ -513,19 +691,40 @@ fn key_from_char(c: char) -> Option<keytap::Key> {
     })
 }
 
+/// Capture-owned half of the daemon's visible note: ONLY the keyboard
+/// thread writes this handle (the re-probe task owns a separate notice
+/// field), so clearing it on tap success can never clobber daemon text.
+fn set_keyboard_note(note: &Arc<Mutex<String>>, text: &str) {
+    *note.lock().unwrap_or_else(|e| e.into_inner()) = text.to_string();
+}
+
+fn clear_keyboard_note(note: &Arc<Mutex<String>>) {
+    note.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 fn run_keyboard_loop(
-    tx: EventSender<CaptureEvent>,
-    paused: Arc<AtomicBool>,
-    exclude_apps: Vec<String>,
-    hotkey: Option<HotkeyChord>,
-    screenshot_root: PathBuf,
+    tx: &EventSender<CaptureEvent>,
+    paused: &AtomicBool,
+    exclude_apps: &[String],
+    hotkey: Option<&HotkeyChord>,
+    screenshot_root: &std::path::Path,
+    screenshots_live: &AtomicBool,
+    keyboard_note: &Arc<Mutex<String>>,
 ) -> anyhow::Result<()> {
-    let tap = keytap::Tap::new().map_err(|e| anyhow::anyhow!("keytap init failed: {e}"))?;
-    let mut source = KeytapSource { tap };
+    let tap = match keytap::Tap::new() {
+        Ok(tap) => {
+            clear_keyboard_note(keyboard_note);
+            KeytapSource { tap }
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("keytap init failed: {e}"));
+        }
+    };
+    let mut source = tap;
     let mut state = KeyState::default();
     // Shoot-first capture for the hotkey chord: synchronous Window shot
     // (Scope honesty from 2b labels the Screen fallback correctly).
-    let shoot_root = screenshot_root.clone();
+    let shoot_root = screenshot_root.to_path_buf();
 
     loop {
         if paused.load(Ordering::Relaxed) {
@@ -536,14 +735,18 @@ fn run_keyboard_loop(
         if raw.is_empty() {
             break;
         }
+        // D-14: without Screen Recording the chord keys fall through to
+        // normal handling — eating the keypress with no screenshot would
+        // be worse than treating it as typing.
+        let hotkey_ref = hotkey.filter(|_| screenshots_live.load(Ordering::Relaxed));
         translate_key_events(
             &raw,
             &mut state,
-            &tx,
-            &exclude_apps,
+            tx,
+            exclude_apps,
             &current_app_context,
             &|| read_clipboard_text().ok(),
-            hotkey.as_ref(),
+            hotkey_ref,
             &|| capture_to_disk(ScreenshotScope::Window, shoot_root.clone()).ok(),
         );
     }
@@ -559,6 +762,7 @@ fn run_focus_loop(
     screenshot_root: PathBuf,
     exclude_apps: Vec<String>,
     paused: Arc<AtomicBool>,
+    screenshots_live: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut last: Option<AppContext> = None;
     // D-09 throttle state: timestamps of recent focus-loop shots.
@@ -590,7 +794,12 @@ fn run_focus_loop(
             // D-09 throttle (2 s cooldown + 3-per-10 s burst, T-02-03) and
             // D-20 idle suppression (hotkey stays live): the FocusChange
             // event above still flows, and `last` still advances below.
-            if screenshot_on_focus_change && !idle.load(Ordering::Relaxed) {
+            // D-14: a revoked Screen Recording grant skips the shot while
+            // titles continue.
+            if screenshot_on_focus_change
+                && !idle.load(Ordering::Relaxed)
+                && screenshots_live.load(Ordering::Relaxed)
+            {
                 let now = Instant::now();
                 shots.retain(|t| now.saturating_duration_since(*t) <= FOCUS_BURST_WINDOW);
                 if should_shoot(now, &shots, min_interval) {
@@ -1198,28 +1407,30 @@ mod tests {
 
     /// Injected probe results flow to the true three-state value: granted
     /// probes stay granted, unprompted denials read undetermined, prompted
-    /// denials read denied. The other two grants stay undetermined until
-    /// task 2 wires their probes.
+    /// denials read denied — independently per grant.
     #[test]
     fn injected_screen_probe_maps_to_three_states() {
         use rustwatch_core::{PermissionsConfig, PermissionState};
         let fresh = PermissionsConfig::default();
-        let granted = super::build_report(true, &fresh);
+        let granted = super::build_report(true, true, true, &fresh);
         assert_eq!(granted.screen_recording, PermissionState::Granted);
-        assert_eq!(granted.input_monitoring, PermissionState::Undetermined);
-        assert_eq!(granted.accessibility, PermissionState::Undetermined);
+        assert_eq!(granted.input_monitoring, PermissionState::Granted);
+        assert_eq!(granted.accessibility, PermissionState::Granted);
 
-        let never_asked = super::build_report(false, &fresh);
+        let never_asked = super::build_report(false, false, false, &fresh);
         assert_eq!(never_asked.screen_recording, PermissionState::Undetermined);
+        assert_eq!(never_asked.input_monitoring, PermissionState::Undetermined);
 
         let asked = PermissionsConfig {
             prompted_screen_recording: true,
+            prompted_input_monitoring: true,
             ..Default::default()
         };
-        let denied = super::build_report(false, &asked);
+        let denied = super::build_report(false, false, false, &asked);
         assert_eq!(denied.screen_recording, PermissionState::Denied);
+        assert_eq!(denied.input_monitoring, PermissionState::Denied);
         // Prompting one grant never flips the others.
-        assert_eq!(denied.input_monitoring, PermissionState::Undetermined);
+        assert_eq!(denied.accessibility, PermissionState::Undetermined);
     }
 
     /// The Quartz idle probe links and returns a sane value.
