@@ -9,11 +9,20 @@ use owo_colors::OwoColorize;
 use rustwatch_analyze::{analyze_pending, render_chart, ChartFormat, Redactor};
 use rustwatch_capture::CaptureHandle;
 use rustwatch_core::{
-    DaemonClient, DaemonCommand, DaemonReply, DataPaths, Note, Store,
-    Config,
+    DaemonClient, DaemonCommand, DaemonReply, DaemonState, DataPaths, Grant, Note,
+    PermissionState, PermissionsState, Store, Config,
 };
 use rustwatch_core::ScreenshotScope;
 use rustwatch_memory::MemoryEngine;
+
+/// Render the launchd plist template: daemon path plus the T-03-01 log
+/// directory. Pure so the KeepAlive dict and log paths are unit-tested
+/// without touching ~/Library.
+pub fn render_plist(daemon_path: &str, logs_dir: &str) -> String {
+    include_str!("../../../deploy/macos/com.rustwatch.plist")
+        .replace("{{RUSTWATCHD_PATH}}", daemon_path)
+        .replace("{{LOGS_DIR}}", logs_dir)
+}
 
 pub fn install(_paths: &DataPaths) -> anyhow::Result<()> {
     let home = std::env::var("HOME")?;
@@ -26,8 +35,10 @@ pub fn install(_paths: &DataPaths) -> anyhow::Result<()> {
         .map(|p| p.join("rustwatchd"))
         .context("locate rustwatchd binary")?;
 
-    let plist = include_str!("../../../deploy/macos/com.rustwatch.plist")
-        .replace("{{RUSTWATCHD_PATH}}", &exe.display().to_string());
+    // T-03-01: launchd logs live under ~/Library/Logs, never /tmp.
+    let logs_dir = format!("{home}/Library/Logs/rustwatch");
+    fs::create_dir_all(&logs_dir)?;
+    let plist = render_plist(&exe.display().to_string(), &logs_dir);
     fs::write(&plist_path, plist)?;
     println!("{}", style("Installed launch agent").green());
     println!("  {plist_path}");
@@ -221,9 +232,325 @@ pub async fn status(paths: &DataPaths, config: &Config) -> anyhow::Result<()> {
             } else {
                 println!("{}", perm_banner.yellow());
             }
+            // D-14: a degraded path names itself here (restart-required,
+            // parked keyboard) — state, never a lone log warning.
+            if !state.capture_note.is_empty() {
+                println!("  note: {}", state.capture_note.yellow());
+            }
         }
     } else {
         println!("{}", "Daemon: not running".yellow());
+    }
+    Ok(())
+}
+
+/// D-08 `doctor`: the single trusted install check. FAILS (exit 1) only on
+/// live breakage — launchd missing, daemon down/wedged, DB not writable.
+/// Everything else (permission gaps, nonzero history counters, ownership
+/// notes, missing API key) WARNS and exits 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+pub struct DoctorCheck {
+    pub name: &'static str,
+    pub status: DoctorStatus,
+    pub detail: String,
+}
+
+/// D-08 exit semantics over injected checks — unit-tested without a daemon.
+pub fn doctor_exit_code(checks: &[DoctorCheck]) -> i32 {
+    if checks.iter().any(|c| c.status == DoctorStatus::Fail) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Best-effort `launchctl list` probe: true when the label is loaded.
+/// A missing launchctl binary (non-macOS) reads as not-loaded, never panics.
+fn launchd_loaded() -> bool {
+    Command::new("launchctl")
+        .args(["list", "com.rustwatch"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Best-effort disk-avail note via `df -k`. Informational only (retention
+/// caps are Phase 4) — `None` when df is missing or unparsable.
+fn disk_avail_note(dir: &std::path::Path) -> Option<String> {
+    let out = Command::new("df").args(["-k"]).arg(dir).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text.lines().nth(1)?;
+    let avail: u64 = row.split_whitespace().nth(3)?.parse().ok()?;
+    Some(format!("disk: ~{} MiB available", avail / 1024))
+}
+
+/// Per-grant fix lines (D-16): exact Settings path as a runnable `open`
+/// command, plus the attach note (restart vs live). Pure over injected
+/// state so the wording is unit-tested.
+pub fn permission_fix_lines(perms: &PermissionsState) -> Vec<String> {
+    let mut lines = Vec::new();
+    for grant in Grant::all() {
+        if grant.state(perms) == PermissionState::Granted {
+            continue;
+        }
+        let attach = if grant.restart_required_on_attach() {
+            "restart rustwatchd after granting (macOS requires it for this grant)"
+        } else {
+            "re-grant attaches live within ~30 s, no restart needed"
+        };
+        lines.push(format!(
+            "{}: {} — fix: open '{}' ({attach})",
+            grant.name(),
+            grant.state(perms).label(),
+            grant.settings_url(),
+        ));
+    }
+    lines
+}
+
+pub async fn doctor(paths: &DataPaths) -> anyhow::Result<()> {
+    let mut checks: Vec<DoctorCheck> = Vec::new();
+
+    // 1. launchd plist installed + loaded.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let plist_path = format!("{home}/Library/LaunchAgents/com.rustwatch.plist");
+    let plist_exists = std::path::Path::new(&plist_path).exists();
+    let loaded = launchd_loaded();
+    checks.push(DoctorCheck {
+        name: "launchd plist",
+        status: if plist_exists && loaded {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Fail
+        },
+        detail: if plist_exists && loaded {
+            format!("installed + loaded ({plist_path})")
+        } else if !plist_exists {
+            format!("missing {plist_path} — run `rustwatch install` then `launchctl load -w {plist_path}`")
+        } else {
+            format!("installed but not loaded — run `launchctl load -w {plist_path}`")
+        },
+    });
+
+    // 2. Daemon socket Ping within timeout: distinguishes not-running
+    // (no socket) from wedged (socket, no reply).
+    let mut live_state: Option<DaemonState> = None;
+    if !paths.socket.exists() {
+        checks.push(DoctorCheck {
+            name: "daemon socket",
+            status: DoctorStatus::Fail,
+            detail: "not running (no socket) — run `rustwatch start`".to_string(),
+        });
+    } else {
+        let client = DaemonClient::new(&paths.socket);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.send(DaemonCommand::Status),
+        )
+        .await
+        {
+            Ok(Ok(DaemonReply::Status { state })) => {
+                live_state = Some(state);
+                checks.push(DoctorCheck {
+                    name: "daemon socket",
+                    status: DoctorStatus::Pass,
+                    detail: "Ping answered within timeout".to_string(),
+                });
+            }
+            _ => checks.push(DoctorCheck {
+                name: "daemon socket",
+                status: DoctorStatus::Fail,
+                detail: "socket exists but no reply (wedged?) — `rustwatch stop`, then `start`"
+                    .to_string(),
+            }),
+        }
+    }
+
+    // 3. DB writable: open plus a probe write inside a rolled-back
+    // transaction (never leaves a row behind).
+    match (|| -> anyhow::Result<()> {
+        let store = Store::open(&paths.sqlite)?;
+        store.connection().execute_batch(
+            "BEGIN IMMEDIATE; CREATE TEMP TABLE doctor_probe(x INTEGER); \
+             INSERT INTO doctor_probe VALUES (1); ROLLBACK;",
+        )?;
+        Ok(())
+    })() {
+        Ok(()) => checks.push(DoctorCheck {
+            name: "database",
+            status: DoctorStatus::Pass,
+            detail: format!("writable ({})", paths.sqlite.display()),
+        }),
+        Err(err) => checks.push(DoctorCheck {
+            name: "database",
+            status: DoctorStatus::Fail,
+            detail: format!("not writable: {err:#}"),
+        }),
+    }
+
+    // 4. Socket/pid ownership note (T-03-04 adjacent: `stop`/`doctor` must
+    // never trust a world-readable socket or a stale pid).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let socket_meta = std::fs::metadata(&paths.socket)
+            .map(|m| m.permissions().mode() & 0o777)
+            .ok();
+        let pid_sane = std::fs::read_to_string(&paths.pid_file)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+            .is_some();
+        let (status, detail) = match socket_meta {
+            None => (
+                DoctorStatus::Warn,
+                "socket absent (daemon not running) — re-check after `rustwatch start`".to_string(),
+            ),
+            Some(0o600) if pid_sane || !paths.pid_file.exists() => (
+                DoctorStatus::Pass,
+                "socket 0600, pid file sane".to_string(),
+            ),
+            Some(mode) => (
+                DoctorStatus::Warn,
+                format!(
+                    "socket mode {mode:o} (want 600), pid file {} — restart the daemon to re-apply",
+                    if paths.pid_file.exists() { "unparsed" } else { "absent" },
+                ),
+            ),
+        };
+        checks.push(DoctorCheck {
+            name: "socket/pid ownership",
+            status,
+            detail,
+        });
+    }
+
+    // 5. Per-permission state + fix. Live daemon state when reachable,
+    // else a local check-only probe (report-only, never prompts).
+    let perms = live_state
+        .as_ref()
+        .map(|s| s.permissions)
+        .unwrap_or_else(|| {
+            let report = CaptureHandle::permissions();
+            PermissionsState {
+                input_monitoring: report.input_monitoring,
+                accessibility: report.accessibility,
+                screen_recording: report.screen_recording,
+            }
+        });
+    let fixes = permission_fix_lines(&perms);
+    checks.push(DoctorCheck {
+        name: "permissions",
+        status: if fixes.is_empty() {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Warn
+        },
+        detail: if fixes.is_empty() {
+            "all granted".to_string()
+        } else {
+            fixes.join("\n    ")
+        },
+    });
+
+    // 6. Screenshots dir writable + disk-space note (retention is Phase 4).
+    let shots_writable = (|| -> bool {
+        if std::fs::create_dir_all(&paths.screenshots).is_err() {
+            return false;
+        }
+        let probe = paths.screenshots.join(".doctor-probe");
+        match std::fs::write(&probe, b"ok") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    })();
+    let disk = disk_avail_note(&paths.screenshots).unwrap_or_else(|| {
+        "disk-space check unavailable (retention caps land in Phase 4)".to_string()
+    });
+    checks.push(DoctorCheck {
+        name: "screenshots dir",
+        status: if shots_writable {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Warn
+        },
+        detail: format!(
+            "{}{}; {disk}",
+            paths.screenshots.display(),
+            if shots_writable { " writable" } else { " NOT writable" },
+        ),
+    });
+
+    // 7. History counters WARN, never fail (D-08).
+    if let Some(state) = &live_state {
+        let noisy = state.write_errors > 0 || state.dropped_events > 0;
+        checks.push(DoctorCheck {
+            name: "loss history",
+            status: if noisy {
+                DoctorStatus::Warn
+            } else {
+                DoctorStatus::Pass
+            },
+            detail: if noisy {
+                format!(
+                    "{} write errors, {} dropped (history — investigate, not fatal)",
+                    state.write_errors, state.dropped_events,
+                )
+            } else {
+                "no write errors, no drops".to_string()
+            },
+        });
+        if !state.capture_note.is_empty() {
+            checks.push(DoctorCheck {
+                name: "capture note",
+                status: DoctorStatus::Warn,
+                detail: state.capture_note.clone(),
+            });
+        }
+    }
+
+    // 8. launchd gets no EnvironmentVariables from this plist: warn when
+    // the key is absent so cloud-classification silence is not a mystery.
+    let has_key = std::env::var("OPENAI_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if !has_key {
+        checks.push(DoctorCheck {
+            name: "OPENAI_API_KEY",
+            status: DoctorStatus::Warn,
+            detail: "absent (and launchd provides no EnvironmentVariables): cloud classification disabled; local capture unaffected".to_string(),
+        });
+    }
+
+    // Report.
+    println!("{}", style("rustwatch doctor").bold());
+    for check in &checks {
+        let (flag, colored) = match check.status {
+            DoctorStatus::Pass => ("[pass]", check.detail.green().to_string()),
+            DoctorStatus::Warn => ("[warn]", check.detail.yellow().to_string()),
+            DoctorStatus::Fail => ("[fail]", check.detail.red().to_string()),
+        };
+        println!("  {flag} {}: {colored}", check.name);
+    }
+    let code = doctor_exit_code(&checks);
+    if code == 0 {
+        println!("{}", style("doctor: healthy").green());
+    } else {
+        println!("{}", style("doctor: live breakage found (exit 1)").red());
+    }
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }
@@ -527,7 +854,6 @@ fn snippet_for(text: &str) -> String {
 mod commands_tests {
     use super::{snippet_for, NoteEditor, NoteOutcome};
     use crossterm::event::KeyCode;
-
     /// CAPT-05: emoji/CJK floods never panic the snippet path.
     #[test]
     fn emoji_flood_snippet_is_char_safe() {
@@ -587,5 +913,99 @@ mod commands_tests {
             NoteOutcome::Save(note) => assert_eq!(note, "ab"),
             _ => panic!("Enter must save"),
         }
+    }
+
+    /// D-08 exit-code matrix: live breakage fails, history-only warns.
+    #[test]
+    fn doctor_exit_code_matrix() {
+        use super::{DoctorCheck, DoctorStatus};
+        let pass = |name: &'static str| DoctorCheck {
+            name,
+            status: DoctorStatus::Pass,
+            detail: String::new(),
+        };
+        // Healthy install exits 0.
+        assert_eq!(super::doctor_exit_code(&vec![pass("a"), pass("b")]), 0);
+        // History-only warnings (loss counters, missing key) still exit 0.
+        assert_eq!(
+            super::doctor_exit_code(&vec![
+                pass("daemon socket"),
+                DoctorCheck {
+                    name: "loss history",
+                    status: DoctorStatus::Warn,
+                    detail: "3 write errors".into(),
+                },
+            ]),
+            0
+        );
+        // Daemon down fails.
+        assert_eq!(
+            super::doctor_exit_code(&vec![
+                pass("launchd plist"),
+                DoctorCheck {
+                    name: "daemon socket",
+                    status: DoctorStatus::Fail,
+                    detail: "not running".into(),
+                },
+            ]),
+            1
+        );
+        // DB unwritable fails even when the daemon answers.
+        assert_eq!(
+            super::doctor_exit_code(&vec![
+                pass("daemon socket"),
+                DoctorCheck {
+                    name: "database",
+                    status: DoctorStatus::Fail,
+                    detail: "not writable".into(),
+                },
+            ]),
+            1
+        );
+    }
+
+    /// Every ungranted grant gets a runnable Settings fix line; granted
+    /// grants stay silent.
+    #[test]
+    fn permission_fix_lines_name_each_gap() {
+        use rustwatch_core::{PermissionsState, PermissionState};
+        let all = PermissionsState {
+            input_monitoring: PermissionState::Granted,
+            accessibility: PermissionState::Granted,
+            screen_recording: PermissionState::Granted,
+        };
+        assert!(super::permission_fix_lines(&all).is_empty());
+
+        let denied_screen = PermissionsState {
+            screen_recording: PermissionState::Denied,
+            ..all
+        };
+        let lines = super::permission_fix_lines(&denied_screen);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("screen recording"));
+        assert!(lines[0].contains("open 'x-apple.systempreferences:"));
+        assert!(lines[0].contains("restart rustwatchd"));
+        // No restart demand for the live-attachable grants.
+        let denied_input = PermissionsState {
+            input_monitoring: PermissionState::Denied,
+            ..all
+        };
+        let lines = super::permission_fix_lines(&denied_input);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("~30 s, no restart needed"));
+    }
+
+    /// The plist renders with substituted paths and the D-06 KeepAlive dict —
+    /// no leftover placeholders, no /tmp logs.
+    #[test]
+    fn plist_template_renders_hardened() {
+        let rendered = super::render_plist("/opt/rw/rustwatchd", "/Users/x/Logs/rustwatch");
+        assert!(rendered.contains("/opt/rw/rustwatchd"));
+        assert!(rendered.contains("/Users/x/Logs/rustwatch/rustwatchd.out.log"));
+        assert!(rendered.contains("/Users/x/Logs/rustwatch/rustwatchd.err.log"));
+        assert!(rendered.contains("<key>SuccessfulExit</key>"));
+        assert!(rendered.contains("<key>ThrottleInterval</key>"));
+        assert!(!rendered.contains("{{"), "unsubstituted placeholder remains");
+        assert!(!rendered.contains("/tmp/"), "world-writable log path remains");
     }
 }

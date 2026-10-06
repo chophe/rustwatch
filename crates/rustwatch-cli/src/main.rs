@@ -20,6 +20,7 @@ enum Commands {
     Start,
     Stop,
     Status,
+    Doctor,
     Permissions,
     Tail {
         #[arg(long, default_value_t = 20)]
@@ -91,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start => commands::start(&paths).await?,
         Commands::Stop => commands::stop(&paths)?,
         Commands::Status => commands::status(&paths, &config).await?,
+        Commands::Doctor => commands::doctor(&paths).await?,
         Commands::Permissions => commands::permissions()?,
         Commands::Tail { limit } => commands::tail(&paths, limit).await?,
         Commands::Screenshot { window, screen } => {
