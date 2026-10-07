@@ -37,6 +37,13 @@ impl DataPaths {
 
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root).map_err(crate::Error::from)?;
+        // T-01-03: the data root holds full keystroke/screen history — owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))
+                .map_err(crate::Error::from)?;
+        }
         std::fs::create_dir_all(&self.lance).map_err(crate::Error::from)?;
         std::fs::create_dir_all(&self.surreal).map_err(crate::Error::from)?;
         std::fs::create_dir_all(&self.screenshots).map_err(crate::Error::from)?;
@@ -81,6 +88,9 @@ pub fn ensure_parent(path: &Path) -> Result<()> {
 pub fn load_or_create_config(path: &Path) -> anyhow::Result<crate::Config> {
     if path.exists() {
         let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        for warning in unknown_config_keys(&raw) {
+            eprintln!("warning: {warning} (in {})", path.display());
+        }
         return Ok(toml::from_str(&raw)?);
     }
     let config = crate::Config::default();
@@ -89,4 +99,134 @@ pub fn load_or_create_config(path: &Path) -> anyhow::Result<crate::Config> {
     }
     std::fs::write(path, toml::to_string_pretty(&config)?)?;
     Ok(config)
+}
+
+/// Persist only the `[permissions] prompted_*` flags (01-03 preflight),
+/// MERGED into the existing file through `toml::Value` — a full-struct
+/// rewrite would drop unknown/future keys and break the SYS-01
+/// forward-compat promise (old `[data]`/`[ui]` remnants, future knobs).
+pub fn save_permissions_prompted(
+    path: &Path,
+    prompted: &crate::PermissionsConfig,
+) -> anyhow::Result<()> {
+    let mut value: toml::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)?;
+        toml::from_str(&raw)?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = value
+        .as_table_mut()
+        .context("config root must be a table")?;
+    let perms = table
+        .entry("permissions")
+        .or_insert(toml::Value::Table(toml::map::Map::new()));
+    let perms_table = perms.as_table_mut().context("[permissions] must be a table")?;
+    perms_table.insert(
+        "prompted_input_monitoring".into(),
+        toml::Value::Boolean(prompted.prompted_input_monitoring),
+    );
+    perms_table.insert(
+        "prompted_accessibility".into(),
+        toml::Value::Boolean(prompted.prompted_accessibility),
+    );
+    perms_table.insert(
+        "prompted_screen_recording".into(),
+        toml::Value::Boolean(prompted.prompted_screen_recording),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod paths_tests {
+    /// Prompt persistence merges: unknown sections/keys survive the write.
+    #[test]
+    fn prompted_save_preserves_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustwatch-prompted-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[capture]\npoll_focus_ms = 500\n\n[data]\ndir = \"x\"\n\n[future]\nkey = 1\n",
+        )
+        .unwrap();
+        let prompted = crate::PermissionsConfig {
+            prompted_input_monitoring: true,
+            ..Default::default()
+        };
+        super::save_permissions_prompted(&path, &prompted).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[data]"), "unknown section dropped: {raw}");
+        assert!(raw.contains("[future]"), "future section dropped: {raw}");
+        let config: crate::Config = toml::from_str(&raw).unwrap();
+        assert!(config.permissions.prompted_input_monitoring);
+        assert!(!config.permissions.prompted_screen_recording);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// SYS-01: every `config.toml` section/key not in the schema. Unknown keys
+/// warn at startup instead of failing or being silently ignored, so removed
+/// fields ([data], [ui], …) and future keys never brick startup.
+pub fn unknown_config_keys(raw: &str) -> Vec<String> {
+    const TOP_LEVEL: &[&str] = &[
+        "capture",
+        "analyze",
+        "memory",
+        "privacy",
+        "permissions",
+    ];
+    fn section_keys(section: &str) -> &'static [&'static str] {
+        match section {
+            "capture" => &[
+                "poll_focus_ms",
+                "exclude_apps",
+                "screenshot_on_focus_change",
+                "screenshot_interval_secs",
+                "min_interval_secs",
+                "idle_start_secs",
+                "idle_end_sustained_secs",
+                "hotkey_enabled",
+                "hotkey_chord",
+            ],
+            "analyze" => &["provider", "model"],
+            "memory" => &["embedding_model", "chunk_max_chars", "graph_expand_hops"],
+            "privacy" => &["redact_patterns"],
+            "permissions" => &[
+                "prompted_input_monitoring",
+                "prompted_accessibility",
+                "prompted_screen_recording",
+            ],
+            _ => &[],
+        }
+    }
+
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(table) = value.as_table() else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for (section, body) in table {
+        if !TOP_LEVEL.contains(&section.as_str()) {
+            warnings.push(format!("unknown config section [{section}]"));
+            continue;
+        }
+        if let Some(sub) = body.as_table() {
+            for key in sub.keys() {
+                if !section_keys(section).contains(&key.as_str()) {
+                    warnings.push(format!("unknown config key {section}.{key}"));
+                }
+            }
+        }
+    }
+    warnings
 }

@@ -10,11 +10,22 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- D-06 pairing: a clean `stop` (exit 0) stays stopped, any crash
+         (nonzero exit) restarts. A bare `KeepAlive=true` would resurrect
+         intentional stops too. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- T-03-02: bound KeepAlive restart storms on poison input. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <!-- T-03-01: logs live under ~/Library/Logs, not world-writable /tmp
+         (symlink-attack surface). Rendered by `rustwatch install`. -->
     <key>StandardOutPath</key>
-    <string>/tmp/rustwatchd.out.log</string>
+    <string>{{LOGS_DIR}}/rustwatchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/rustwatchd.err.log</string>
+    <string>{{LOGS_DIR}}/rustwatchd.err.log</string>
 </dict>
 </plist>

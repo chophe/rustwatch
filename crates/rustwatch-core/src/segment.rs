@@ -10,6 +10,10 @@ const MAX_BUFFER_CHARS: usize = 16_384;
 
 pub struct SegmentGrouper {
     current: Option<ActiveSegment>,
+    /// D-18/D-19: set by `mark_idle`, cleared by `mark_active`. Segments
+    /// opened while set carry `idle: true` — capture continues through idle,
+    /// reports exclude it later.
+    idle: bool,
 }
 
 struct ActiveSegment {
@@ -18,11 +22,47 @@ struct ActiveSegment {
     text_buffer: String,
     started_at: chrono::DateTime<Utc>,
     event_count: u64,
+    idle: bool,
 }
 
 impl SegmentGrouper {
     pub fn new() -> Self {
-        Self { current: None }
+        Self {
+            current: None,
+            idle: false,
+        }
+    }
+
+    /// The currently open segment's id, if any — the writer fills
+    /// `segment_id` on screenshot rows instead of hardcoding None.
+    pub fn open_segment_id(&self) -> Option<String> {
+        self.current.as_ref().map(|active| active.id.clone())
+    }
+
+    /// D-18: close the active segment marked `idle: true`. Pure — no clock,
+    /// no I/O; the capture layer injects the signal with its own timestamp.
+    /// A no-op (returning None) when already idle or with no open segment,
+    /// but the flag is still set so later segments open idle.
+    pub fn mark_idle(&mut self, timestamp: chrono::DateTime<Utc>) -> Option<SessionSegment> {
+        self.idle = true;
+        // Forced: the segment closed here covered active work, but D-18
+        // marks the close itself idle — reports exclude it either way.
+        self.current.take().map(|active| {
+            let mut segment = active.into_segment(timestamp);
+            segment.idle = true;
+            segment
+        })
+    }
+
+    /// D-19: end idle after sustained activity. Closes the idle segment so
+    /// post-resume work starts fresh — otherwise it would append to an
+    /// `idle: true` row until the next focus change. No-op when not idle.
+    pub fn mark_active(&mut self, timestamp: chrono::DateTime<Utc>) -> Option<SessionSegment> {
+        if !self.idle {
+            return None;
+        }
+        self.idle = false;
+        self.current.take().map(|active| active.into_segment(timestamp))
     }
 
     pub fn on_event(&mut self, event: &CaptureEvent) -> Option<SessionSegment> {
@@ -60,6 +100,8 @@ impl SegmentGrouper {
                 }
                 None
             }
+            CaptureEventKind::IdleStart { .. } => self.mark_idle(event.timestamp),
+            CaptureEventKind::ActivityResumed => self.mark_active(event.timestamp),
         }
     }
 
@@ -78,12 +120,14 @@ impl SegmentGrouper {
             process_id: 0,
             bundle_id: None,
         });
+        let idle = self.idle;
         self.current = Some(ActiveSegment {
             id: Uuid::new_v4().to_string(),
             app,
             text_buffer: String::new(),
             started_at: event.timestamp,
             event_count: 0,
+            idle,
         });
     }
 
@@ -97,12 +141,14 @@ impl SegmentGrouper {
         timestamp: chrono::DateTime<Utc>,
     ) -> Option<SessionSegment> {
         let previous = self.current.take().map(|active| active.into_segment(timestamp));
+        let idle = self.idle;
         self.current = Some(ActiveSegment {
             id: Uuid::new_v4().to_string(),
             app,
             text_buffer: String::new(),
             started_at: timestamp,
             event_count: 0,
+            idle,
         });
         previous
     }
@@ -126,6 +172,7 @@ impl ActiveSegment {
             started_at: self.started_at,
             ended_at,
             event_count: self.event_count,
+            idle: self.idle,
         }
     }
 }
@@ -342,5 +389,90 @@ mod tests {
     fn flush_on_empty_grouper_returns_none() {
         let mut g = SegmentGrouper::new();
         assert!(g.flush().is_none());
+    }
+
+    /// D-18: idle closes the active segment marked `idle: true`.
+    #[test]
+    fn mark_idle_closes_segment_as_idle() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("work"));
+        let closed = g.mark_idle(chrono::Utc::now()).expect("segment closed");
+        assert!(closed.idle);
+        assert_eq!(closed.text_buffer, "work");
+    }
+
+    /// Capture continues through idle: segments opened while idle are born
+    /// idle, so a stray nudge never pollutes work reports.
+    #[test]
+    fn segments_opened_during_idle_are_idle() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("work"));
+        g.mark_idle(chrono::Utc::now());
+        g.on_event(&text_delta("nudge"));
+        let seg = g.flush().expect("segment");
+        assert!(seg.idle);
+        assert_eq!(seg.text_buffer, "nudge");
+    }
+
+    /// D-19: resume closes the idle segment so post-resume work starts
+    /// fresh instead of appending to an `idle: true` row.
+    #[test]
+    fn mark_active_closes_idle_segment_and_clears() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("work"));
+        g.mark_idle(chrono::Utc::now());
+        g.on_event(&text_delta("back"));
+        let closed = g.mark_active(chrono::Utc::now()).expect("idle closed");
+        assert!(closed.idle);
+        g.on_event(&text_delta("fresh"));
+        let seg = g.flush().expect("segment");
+        assert!(!seg.idle);
+        assert_eq!(seg.text_buffer, "fresh");
+    }
+
+    #[test]
+    fn mark_active_is_noop_when_not_idle() {
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("work"));
+        assert!(g.mark_active(chrono::Utc::now()).is_none());
+        let seg = g.flush().expect("segment still open");
+        assert!(!seg.idle);
+    }
+
+    #[test]
+    fn double_mark_idle_stays_idle_without_panic() {
+        let mut g = SegmentGrouper::new();
+        assert!(g.mark_idle(chrono::Utc::now()).is_none());
+        g.on_event(&text_delta("nudge"));
+        let reopened = g.mark_idle(chrono::Utc::now()).expect("idle segment closed");
+        assert!(reopened.idle);
+    }
+
+    #[test]
+    fn open_segment_id_tracks_the_active_segment() {
+        let mut g = SegmentGrouper::new();
+        assert_eq!(g.open_segment_id(), None);
+        g.on_event(&text_delta("work"));
+        assert!(g.open_segment_id().is_some());
+        g.mark_idle(chrono::Utc::now());
+        assert_eq!(g.open_segment_id(), None);
+    }
+
+    /// The synthetic idle signals fold through `on_event` like any event.
+    #[test]
+    fn idle_signals_fold_through_on_event() {
+        use crate::events::CaptureEventKind;
+        let mut g = SegmentGrouper::new();
+        g.on_event(&text_delta("work"));
+        let idle_signal = CaptureEvent::new(
+            CaptureEventKind::IdleStart { idle_secs: 301 },
+            None,
+        );
+        let closed = g.on_event(&idle_signal).expect("closed at idle");
+        assert!(closed.idle);
+        let resume_signal = CaptureEvent::new(CaptureEventKind::ActivityResumed, None);
+        assert!(g.on_event(&resume_signal).is_none());
+        g.on_event(&text_delta("fresh"));
+        assert!(!g.flush().expect("segment").idle);
     }
 }

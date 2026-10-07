@@ -38,6 +38,12 @@ pub enum CaptureEventKind {
         path: PathBuf,
         scope: ScreenshotScope,
     },
+    /// D-17/D-18: synthetic idle signals injected by the scheduler's idle
+    /// poll (Pattern 2). Real ledger rows — the idle history is auditable.
+    IdleStart {
+        idle_secs: u64,
+    },
+    ActivityResumed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +83,19 @@ pub struct SessionSegment {
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub event_count: u64,
+    /// D-18: true when the segment was open during hardware idle. Reports
+    /// exclude idle segments (Phase 5); capture continues regardless.
+    pub idle: bool,
+}
+
+/// D-10 annotation notes (hotkey shoot-first-prompt-second) plus D-18
+/// idle marking. Reports exclude idle segments; the digest reads notes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Note {
+    pub id: String,
+    pub ts: DateTime<Utc>,
+    pub note: String,
+    pub screenshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

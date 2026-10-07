@@ -20,6 +20,7 @@ enum Commands {
     Start,
     Stop,
     Status,
+    Doctor,
     Permissions,
     Tail {
         #[arg(long, default_value_t = 20)]
@@ -31,6 +32,7 @@ enum Commands {
         #[arg(long)]
         screen: bool,
     },
+    Annotate,
     Export {
         #[arg(long)]
         from: Option<String>,
@@ -90,11 +92,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start => commands::start(&paths).await?,
         Commands::Stop => commands::stop(&paths)?,
         Commands::Status => commands::status(&paths, &config).await?,
+        Commands::Doctor => commands::doctor(&paths).await?,
         Commands::Permissions => commands::permissions()?,
         Commands::Tail { limit } => commands::tail(&paths, limit).await?,
         Commands::Screenshot { window, screen } => {
             commands::screenshot(&paths, window, screen).await?
         }
+        Commands::Annotate => commands::annotate(&paths, &config)?,
         Commands::Export { from, to } => commands::export(&paths, from, to)?,
         Commands::Analyze { today: _ } => commands::analyze(&paths, &config).await?,
         Commands::Chart { date, format } => commands::chart(&paths, date, format)?,
