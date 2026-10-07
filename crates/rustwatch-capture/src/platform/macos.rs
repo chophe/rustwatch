@@ -8,7 +8,6 @@ use rustwatch_core::{
     events::{AppContext, CaptureEvent, CaptureEventKind, ScreenshotScope},
     is_excluded, key_to_text, LogicalKey, Modifiers, Result,
 };
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
@@ -487,12 +486,6 @@ fn scope_label(scope: ScreenshotScope) -> &'static str {
         ScreenshotScope::Window => "window",
         ScreenshotScope::Screen => "screen",
     }
-}
-
-pub fn hash_content(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
