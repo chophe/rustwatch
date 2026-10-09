@@ -15,6 +15,40 @@ use rustwatch_core::{
 use rustwatch_core::ScreenshotScope;
 use rustwatch_memory::MemoryEngine;
 
+/// Candidate locations for the `rustwatchd` binary, in resolution order:
+/// a sibling of the CLI (cargo target dirs and single-bin-dir installs) first,
+/// then `../libexec` for packaged layouts that keep the daemon out of `bin`.
+/// Pure over the CLI's directory so both layouts are unit-tested.
+pub fn daemon_candidates(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![exe_dir.to_path_buf()];
+    if let Some(parent) = exe_dir.parent() {
+        dirs.push(parent.join("libexec"));
+    }
+    dirs.iter().map(|d| d.join("rustwatchd")).collect()
+}
+
+/// Locate `rustwatchd` next to the running CLI. Names every path it checked,
+/// so a missing binary is an actionable message rather than a bare ENOENT.
+fn locate_daemon() -> anyhow::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().context("current exe has no parent directory")?;
+    let candidates = daemon_candidates(dir);
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .with_context(|| {
+            format!(
+                "rustwatchd binary not found — looked for: {}",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
 /// Render the launchd plist template: daemon path plus the T-03-01 log
 /// directory. Pure so the KeepAlive dict and log paths are unit-tested
 /// without touching ~/Library.
@@ -29,11 +63,7 @@ pub fn install(_paths: &DataPaths) -> anyhow::Result<()> {
     let plist_dir = format!("{home}/Library/LaunchAgents");
     fs::create_dir_all(&plist_dir)?;
     let plist_path = format!("{plist_dir}/com.rustwatch.plist");
-    let exe = std::env::current_exe()?
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("rustwatchd"))
-        .context("locate rustwatchd binary")?;
+    let exe = locate_daemon()?;
 
     // T-03-01: launchd logs live under ~/Library/Logs, never /tmp.
     let logs_dir = format!("{home}/Library/Logs/rustwatch");
@@ -61,11 +91,7 @@ pub async fn start(paths: &DataPaths) -> anyhow::Result<()> {
         }
     }
 
-    let exe = std::env::current_exe()?
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("rustwatchd"))
-        .context("locate rustwatchd binary")?;
+    let exe = locate_daemon()?;
 
     // Daemon stderr goes to a log file so a failed start can report its tail.
     let log_file = std::fs::OpenOptions::new()
@@ -852,8 +878,21 @@ fn snippet_for(text: &str) -> String {
 
 #[cfg(test)]
 mod commands_tests {
-    use super::{snippet_for, NoteEditor, NoteOutcome};
+    use super::{daemon_candidates, snippet_for, NoteEditor, NoteOutcome};
     use crossterm::event::KeyCode;
+
+    /// Both layouts resolve: cargo sibling dir first, then ../libexec.
+    #[test]
+    fn daemon_candidates_cover_dev_and_packaged_layouts() {
+        let dev = daemon_candidates(std::path::Path::new("/repo/target/debug"));
+        assert_eq!(dev[0], std::path::PathBuf::from("/repo/target/debug/rustwatchd"));
+        assert_eq!(dev[1], std::path::PathBuf::from("/repo/target/libexec/rustwatchd"));
+
+        let sys = daemon_candidates(std::path::Path::new("/usr/local/bin"));
+        assert_eq!(sys[0], std::path::PathBuf::from("/usr/local/bin/rustwatchd"));
+        assert_eq!(sys[1], std::path::PathBuf::from("/usr/local/libexec/rustwatchd"));
+    }
+
     /// CAPT-05: emoji/CJK floods never panic the snippet path.
     #[test]
     fn emoji_flood_snippet_is_char_safe() {

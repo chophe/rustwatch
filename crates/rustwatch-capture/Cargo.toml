@@ -12,7 +12,6 @@ arboard = "3"
 chrono = { workspace = true }
 rustwatch-core.workspace = true
 serde.workspace = true
-sha2 = "0.10"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
