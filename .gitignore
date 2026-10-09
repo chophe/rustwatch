@@ -22,3 +22,13 @@ target
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Editor / AI-agent tool state — local per-machine, not project source.
+/.adal/
+/.cursor/
+/.kiro/
+/.windsurf/
+
+# Regenerable tool output and local scratch files.
+/graphify-out/
+test1.md
